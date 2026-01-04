@@ -50,113 +50,129 @@ interface MetricHistory {
   values: number[];
 }
 
-// Circular Gauge Component
+// Circular Gauge Component - Smooth animations
 function GaugeChart({ value, max, label, color, size = 120 }: {
   value: number; max: number; label: string; color: string; size?: number
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
+  const prevValueRef = useRef(0);
 
   useEffect(() => {
     if (!svgRef.current) return;
 
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
-
     const width = size;
     const height = size;
     const radius = Math.min(width, height) / 2 - 10;
     const thickness = 12;
-
-    const g = svg
-      .attr("width", width)
-      .attr("height", height)
-      .append("g")
-      .attr("transform", `translate(${width / 2}, ${height / 2})`);
-
-    // Background arc
-    const bgArc = d3.arc<unknown>()
-      .innerRadius(radius - thickness)
-      .outerRadius(radius)
-      .startAngle(0)
-      .endAngle(2 * Math.PI);
-
-    g.append("path")
-      .attr("d", bgArc({}) || "")
-      .attr("fill", "#1f2937");
-
-    // Value arc
     const percentage = Math.min(value / max, 1);
+    const prevPercentage = prevValueRef.current;
+
+    // Initialize only once
+    if (svg.select("g.gauge-group").empty()) {
+      svg.attr("width", width).attr("height", height);
+
+      // Gradient definition
+      const defs = svg.append("defs");
+      const gradient = defs.append("linearGradient")
+        .attr("id", `gradient-${label.replace(/\s/g, "")}`)
+        .attr("x1", "0%").attr("y1", "0%")
+        .attr("x2", "100%").attr("y2", "100%");
+      gradient.append("stop").attr("offset", "0%").attr("stop-color", color);
+      gradient.append("stop").attr("offset", "100%").attr("stop-color", d3.color(color)?.darker(0.5)?.toString() || color);
+
+      const g = svg.append("g")
+        .attr("class", "gauge-group")
+        .attr("transform", `translate(${width / 2}, ${height / 2})`);
+
+      // Background arc
+      const bgArc = d3.arc<unknown>()
+        .innerRadius(radius - thickness)
+        .outerRadius(radius)
+        .startAngle(0)
+        .endAngle(2 * Math.PI);
+
+      g.append("path")
+        .attr("class", "bg-arc")
+        .attr("d", bgArc({}) || "")
+        .attr("fill", "#1f2937");
+
+      // Value arc
+      g.append("path")
+        .attr("class", "value-arc")
+        .attr("fill", `url(#gradient-${label.replace(/\s/g, "")})`);
+
+      // Center text
+      g.append("text")
+        .attr("class", "value-text")
+        .attr("text-anchor", "middle")
+        .attr("dy", "0.1em")
+        .attr("fill", "#fff")
+        .attr("font-size", size / 4)
+        .attr("font-weight", "bold");
+
+      g.append("text")
+        .attr("text-anchor", "middle")
+        .attr("dy", "1.8em")
+        .attr("fill", "#9ca3af")
+        .attr("font-size", size / 10)
+        .text(label);
+    }
+
+    const g = svg.select("g.gauge-group");
+
+    // Value arc with smooth transition
     const valueArc = d3.arc<unknown>()
       .innerRadius(radius - thickness)
       .outerRadius(radius)
       .startAngle(0)
       .cornerRadius(6);
 
-    g.append("path")
-      .datum({ endAngle: 0 })
-      .attr("d", (d: { endAngle: number }) => valueArc({ ...d, startAngle: 0 }) || "")
-      .attr("fill", `url(#gradient-${label.replace(/\s/g, "")})`)
+    g.select("path.value-arc")
       .transition()
-      .duration(750)
+      .duration(800)
+      .ease(d3.easeCubicOut)
       .attrTween("d", function() {
-        const interpolate = d3.interpolate(0, percentage * 2 * Math.PI);
+        const interpolate = d3.interpolate(prevPercentage * 2 * Math.PI, percentage * 2 * Math.PI);
         return function(t: number) {
           return valueArc({ startAngle: 0, endAngle: interpolate(t) }) || "";
         };
       });
 
-    // Gradient definition
-    const defs = svg.append("defs");
-    const gradient = defs.append("linearGradient")
-      .attr("id", `gradient-${label.replace(/\s/g, "")}`)
-      .attr("x1", "0%").attr("y1", "0%")
-      .attr("x2", "100%").attr("y2", "100%");
-    gradient.append("stop").attr("offset", "0%").attr("stop-color", color);
-    gradient.append("stop").attr("offset", "100%").attr("stop-color", d3.color(color)?.darker(0.5)?.toString() || color);
+    // Animate number
+    g.select("text.value-text")
+      .transition()
+      .duration(800)
+      .ease(d3.easeCubicOut)
+      .tween("text", function() {
+        const interpolate = d3.interpolate(prevPercentage * 100, percentage * 100);
+        return function(t: number) {
+          d3.select(this).text(`${Math.round(interpolate(t))}%`);
+        };
+      });
 
-    // Center text
-    g.append("text")
-      .attr("text-anchor", "middle")
-      .attr("dy", "0.1em")
-      .attr("fill", "#fff")
-      .attr("font-size", size / 4)
-      .attr("font-weight", "bold")
-      .text(`${Math.round(percentage * 100)}%`);
-
-    g.append("text")
-      .attr("text-anchor", "middle")
-      .attr("dy", "1.8em")
-      .attr("fill", "#9ca3af")
-      .attr("font-size", size / 10)
-      .text(label);
-
+    prevValueRef.current = percentage;
   }, [value, max, label, color, size]);
 
   return <svg ref={svgRef} />;
 }
 
-// Line Chart Component for History
+// Line Chart Component - Smooth real-time updates without flicker
 function LineChart({ data, colors, height = 150 }: {
   data: MetricHistory[]; colors: string[]; height?: number
 }) {
   const svgRef = useRef<SVGSVGElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const initializedRef = useRef(false);
 
   useEffect(() => {
     if (!svgRef.current || !containerRef.current || data.length === 0) return;
 
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
-
     const width = containerRef.current.clientWidth;
     const margin = { top: 20, right: 20, bottom: 30, left: 40 };
     const innerWidth = width - margin.left - margin.right;
     const innerHeight = height - margin.top - margin.bottom;
-
-    svg.attr("width", width).attr("height", height);
-
-    const g = svg.append("g")
-      .attr("transform", `translate(${margin.left},${margin.top})`);
 
     // Scales
     const xScale = d3.scaleTime()
@@ -167,24 +183,92 @@ function LineChart({ data, colors, height = 150 }: {
       .domain([0, 100])
       .range([innerHeight, 0]);
 
-    // Grid lines
-    g.append("g")
-      .attr("class", "grid")
-      .attr("opacity", 0.1)
-      .call(d3.axisLeft(yScale).tickSize(-innerWidth).tickFormat(() => ""));
+    // Initialize chart structure only once
+    if (!initializedRef.current) {
+      svg.attr("width", width).attr("height", height);
 
-    // X Axis
-    g.append("g")
-      .attr("transform", `translate(0,${innerHeight})`)
-      .attr("color", "#4b5563")
-      .call(d3.axisBottom(xScale).ticks(5).tickFormat(d => d3.timeFormat("%H:%M")(d as Date)));
+      // Create defs for gradients
+      const defs = svg.append("defs");
+      colors.forEach((color, i) => {
+        const gradient = defs.append("linearGradient")
+          .attr("id", `line-area-gradient-${i}`)
+          .attr("x1", "0%").attr("y1", "0%")
+          .attr("x2", "0%").attr("y2", "100%");
+        gradient.append("stop")
+          .attr("offset", "0%")
+          .attr("stop-color", color)
+          .attr("stop-opacity", 0.25);
+        gradient.append("stop")
+          .attr("offset", "100%")
+          .attr("stop-color", color)
+          .attr("stop-opacity", 0);
+      });
 
-    // Y Axis
-    g.append("g")
-      .attr("color", "#4b5563")
-      .call(d3.axisLeft(yScale).ticks(5).tickFormat(d => `${d}%`));
+      const g = svg.append("g")
+        .attr("class", "chart-group")
+        .attr("transform", `translate(${margin.left},${margin.top})`);
 
-    // Lines for each GPU
+      // Grid lines
+      g.append("g")
+        .attr("class", "grid")
+        .attr("opacity", 0.08);
+
+      // X Axis
+      g.append("g")
+        .attr("class", "x-axis")
+        .attr("transform", `translate(0,${innerHeight})`)
+        .attr("color", "#4b5563");
+
+      // Y Axis
+      g.append("g")
+        .attr("class", "y-axis")
+        .attr("color", "#4b5563");
+
+      // Create path groups for each GPU
+      const numGPUs = data[0]?.values?.length || 2;
+      for (let i = 0; i < numGPUs; i++) {
+        g.append("path")
+          .attr("class", `area-${i}`)
+          .attr("fill", `url(#line-area-gradient-${i})`);
+
+        g.append("path")
+          .attr("class", `line-${i}`)
+          .attr("fill", "none")
+          .attr("stroke", colors[i % colors.length])
+          .attr("stroke-width", 2.5)
+          .attr("stroke-linecap", "round")
+          .attr("stroke-linejoin", "round");
+      }
+
+      initializedRef.current = true;
+    }
+
+    const g = svg.select("g.chart-group");
+    const transitionDuration = 400;
+    const easing = d3.easeCubicOut;
+
+    // Update grid
+    g.select("g.grid")
+      .transition()
+      .duration(transitionDuration)
+      .ease(easing)
+      .call(d3.axisLeft(yScale).tickSize(-innerWidth).tickFormat(() => "") as never);
+
+    // Update X Axis with smooth transition
+    g.select("g.x-axis")
+      .transition()
+      .duration(transitionDuration)
+      .ease(easing)
+      .call(d3.axisBottom(xScale).ticks(5).tickFormat(d => d3.timeFormat("%H:%M")(d as Date)) as never);
+
+    // Update Y Axis
+    g.select("g.y-axis")
+      .transition()
+      .duration(transitionDuration)
+      .ease(easing)
+      .call(d3.axisLeft(yScale).ticks(5).tickFormat(d => `${d}%`) as never);
+
+    // Update lines and areas for each GPU
     if (data.length > 0 && data[0].values) {
       const numGPUs = data[0].values.length;
 
@@ -192,116 +276,230 @@ function LineChart({ data, colors, height = 150 }: {
         const line = d3.line<MetricHistory>()
           .x(d => xScale(new Date(d.timestamp)))
           .y(d => yScale(d.values[i] || 0))
-          .curve(d3.curveMonotoneX);
+          .curve(d3.curveCatmullRom.alpha(0.5));
 
-        // Gradient area
         const area = d3.area<MetricHistory>()
           .x(d => xScale(new Date(d.timestamp)))
           .y0(innerHeight)
           .y1(d => yScale(d.values[i] || 0))
-          .curve(d3.curveMonotoneX);
+          .curve(d3.curveCatmullRom.alpha(0.5));
 
-        const areaGradient = svg.append("defs")
-          .append("linearGradient")
-          .attr("id", `area-gradient-${i}`)
-          .attr("x1", "0%").attr("y1", "0%")
-          .attr("x2", "0%").attr("y2", "100%");
-        areaGradient.append("stop")
-          .attr("offset", "0%")
-          .attr("stop-color", colors[i % colors.length])
-          .attr("stop-opacity", 0.3);
-        areaGradient.append("stop")
-          .attr("offset", "100%")
-          .attr("stop-color", colors[i % colors.length])
-          .attr("stop-opacity", 0);
-
-        g.append("path")
+        // Smooth transition for area
+        g.select(`path.area-${i}`)
           .datum(data)
-          .attr("fill", `url(#area-gradient-${i})`)
+          .transition()
+          .duration(transitionDuration)
+          .ease(easing)
           .attr("d", area);
 
-        g.append("path")
+        // Smooth transition for line
+        g.select(`path.line-${i}`)
           .datum(data)
-          .attr("fill", "none")
-          .attr("stroke", colors[i % colors.length])
-          .attr("stroke-width", 2)
+          .transition()
+          .duration(transitionDuration)
+          .ease(easing)
           .attr("d", line);
       }
     }
-
   }, [data, colors, height]);
 
   return (
     <div ref={containerRef} className="w-full">
-      <svg ref={svgRef} />
+      <svg ref={svgRef} style={{ overflow: 'visible' }} />
     </div>
   );
 }
 
-// Donut Chart for Task Status
+// Donut Chart - Professional staggered animation with elastic easing
 function DonutChart({ data }: { data: { label: string; value: number; color: string }[] }) {
   const svgRef = useRef<SVGSVGElement>(null);
+  const prevDataRef = useRef<typeof data>([]);
 
   useEffect(() => {
-    if (!svgRef.current) return;
+    if (!svgRef.current || data.length === 0) return;
 
     const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
-
     const width = 200;
     const height = 200;
     const radius = Math.min(width, height) / 2;
-
-    const g = svg
-      .attr("width", width)
-      .attr("height", height)
-      .append("g")
-      .attr("transform", `translate(${width / 2}, ${height / 2})`);
+    const total = data.reduce((sum, d) => sum + d.value, 0);
+    const prevTotal = prevDataRef.current.reduce((sum, d) => sum + d.value, 0);
 
     const pie = d3.pie<{ label: string; value: number; color: string }>()
       .value(d => d.value)
-      .sort(null);
+      .sort(null)
+      .padAngle(0.03);
 
     const arc = d3.arc<d3.PieArcDatum<{ label: string; value: number; color: string }>>()
-      .innerRadius(radius * 0.6)
-      .outerRadius(radius * 0.9)
-      .cornerRadius(4)
-      .padAngle(0.02);
+      .innerRadius(radius * 0.58)
+      .outerRadius(radius * 0.88)
+      .cornerRadius(6);
 
-    const total = data.reduce((sum, d) => sum + d.value, 0);
+    // Raw arc for interpolation (untyped)
+    const rawArc = d3.arc()
+      .innerRadius(radius * 0.58)
+      .outerRadius(radius * 0.88)
+      .cornerRadius(6);
 
-    g.selectAll("path")
-      .data(pie(data))
-      .enter()
-      .append("path")
-      .attr("d", arc)
-      .attr("fill", d => d.data.color)
-      .attr("opacity", 0.9)
+    const hoverArc = d3.arc<d3.PieArcDatum<{ label: string; value: number; color: string }>>()
+      .innerRadius(radius * 0.56)
+      .outerRadius(radius * 0.92)
+      .cornerRadius(6);
+
+    // Initialize only once
+    if (svg.select("g.donut-group").empty()) {
+      svg.attr("width", width).attr("height", height);
+
+      // Add shadow filter
+      const defs = svg.append("defs");
+      const filter = defs.append("filter")
+        .attr("id", "donut-shadow")
+        .attr("x", "-50%")
+        .attr("y", "-50%")
+        .attr("width", "200%")
+        .attr("height", "200%");
+      filter.append("feDropShadow")
+        .attr("dx", 0)
+        .attr("dy", 2)
+        .attr("stdDeviation", 4)
+        .attr("flood-color", "rgba(0,0,0,0.3)");
+
+      const g = svg.append("g")
+        .attr("class", "donut-group")
+        .attr("transform", `translate(${width / 2}, ${height / 2})`);
+
+      // Paths container
+      g.append("g").attr("class", "slices");
+
+      // Center text group
+      const centerGroup = g.append("g").attr("class", "center-text");
+      centerGroup.append("text")
+        .attr("class", "total-value")
+        .attr("text-anchor", "middle")
+        .attr("dy", "-0.1em")
+        .attr("fill", "#fff")
+        .attr("font-size", "32px")
+        .attr("font-weight", "bold")
+        .attr("opacity", 0);
+
+      centerGroup.append("text")
+        .attr("class", "total-label")
+        .attr("text-anchor", "middle")
+        .attr("dy", "1.4em")
+        .attr("fill", "#9ca3af")
+        .attr("font-size", "11px")
+        .attr("letter-spacing", "0.5px")
+        .text("TOTAL TASKS")
+        .attr("opacity", 0);
+    }
+
+    const g = svg.select("g.donut-group");
+    const slicesGroup = g.select("g.slices");
+
+    // Update slices with proper enter/update/exit pattern
+    const slices = slicesGroup.selectAll<SVGPathElement, d3.PieArcDatum<typeof data[0]>>("path")
+      .data(pie(data), d => d.data.label);
+
+    // Remove old slices
+    slices.exit()
       .transition()
-      .duration(750)
-      .attrTween("d", function(d) {
-        const interpolate = d3.interpolate({ startAngle: 0, endAngle: 0 }, d);
+      .duration(500)
+      .ease(d3.easeCubicIn)
+      .attrTween("d", function() {
+        const d = d3.select(this).datum() as d3.PieArcDatum<typeof data[0]>;
+        const targetAngle = d.endAngle;
+        const interpolate = d3.interpolate(
+          { startAngle: d.startAngle, endAngle: d.endAngle },
+          { startAngle: targetAngle, endAngle: targetAngle }
+        );
         return function(t) {
-          return arc(interpolate(t)) || "";
+          return rawArc(interpolate(t) as d3.DefaultArcObject) || "";
+        };
+      })
+      .style("opacity", 0)
+      .remove();
+
+    // Update existing slices
+    slices
+      .transition()
+      .duration(800)
+      .ease(d3.easeCubicOut)
+      .attrTween("d", function(d) {
+        const current = d3.select(this).datum() as d3.PieArcDatum<typeof data[0]>;
+        const fromArc = { startAngle: current.startAngle, endAngle: current.endAngle };
+        const toArc = { startAngle: d.startAngle, endAngle: d.endAngle };
+        const interpolate = d3.interpolate(fromArc, toArc);
+        return function(t) {
+          return rawArc(interpolate(t) as d3.DefaultArcObject) || "";
+        };
+      })
+      .attr("fill", d => d.data.color);
+
+    // Add new slices with staggered animation
+    slices.enter()
+      .append("path")
+      .attr("fill", d => d.data.color)
+      .attr("filter", "url(#donut-shadow)")
+      .style("cursor", "pointer")
+      .each(function(d, i) {
+        const path = d3.select(this);
+
+        // Start from previous position (collapsed arc)
+        const startArc = { startAngle: d.startAngle, endAngle: d.startAngle };
+        const endArc = { startAngle: d.startAngle, endAngle: d.endAngle };
+        path.attr("d", rawArc(startArc as d3.DefaultArcObject) || "");
+
+        // Animate to final position with stagger
+        path.transition()
+          .delay(i * 120)
+          .duration(900)
+          .ease(d3.easeCubicOut)
+          .attrTween("d", function() {
+            const interpolate = d3.interpolate(startArc, endArc);
+            return function(t) {
+              return rawArc(interpolate(t) as d3.DefaultArcObject) || "";
+            };
+          });
+      })
+      .on("mouseenter", function(event, d) {
+        d3.select(this)
+          .transition()
+          .duration(200)
+          .ease(d3.easeCubicOut)
+          .attr("d", hoverArc(d) || "");
+      })
+      .on("mouseleave", function(event, d) {
+        d3.select(this)
+          .transition()
+          .duration(300)
+          .ease(d3.easeCubicOut)
+          .attr("d", arc(d) || "");
+      });
+
+    // Animate center text
+    const centerText = g.select("g.center-text");
+
+    centerText.select("text.total-value")
+      .transition()
+      .delay(200)
+      .duration(800)
+      .ease(d3.easeCubicOut)
+      .attr("opacity", 1)
+      .tween("text", function() {
+        const interpolate = d3.interpolate(prevTotal, total);
+        return function(t) {
+          d3.select(this).text(Math.round(interpolate(t)));
         };
       });
 
-    // Center text
-    g.append("text")
-      .attr("text-anchor", "middle")
-      .attr("dy", "-0.2em")
-      .attr("fill", "#fff")
-      .attr("font-size", "28px")
-      .attr("font-weight", "bold")
-      .text(total);
+    centerText.select("text.total-label")
+      .transition()
+      .delay(400)
+      .duration(600)
+      .ease(d3.easeCubicOut)
+      .attr("opacity", 1);
 
-    g.append("text")
-      .attr("text-anchor", "middle")
-      .attr("dy", "1.2em")
-      .attr("fill", "#9ca3af")
-      .attr("font-size", "12px")
-      .text("Total Tasks");
-
+    prevDataRef.current = data;
   }, [data]);
 
   return <svg ref={svgRef} />;
