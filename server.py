@@ -1,19 +1,26 @@
 """
-VrunGPU - Remote GPU Execution Server
+VrunGPU - Remote GPU Execution Server v0.4.0
 Python 코드를 원격으로 실행하고 GPU 리소스를 활용하는 REST API 서버
-멀티 GPU 병렬 작업 지원 + WebSocket 실시간 스트리밍 + ZIP 프로젝트 업로드
+
+Features:
+- 멀티 GPU 병렬 작업 지원
+- WebSocket 실시간 스트리밍
+- ZIP 프로젝트 업로드
+- SQLite 영구 저장소
+- 모델 관리 및 추론 API
 """
 
 import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
 import uuid
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -21,8 +28,106 @@ from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+
+# ============================================================================
+# Configuration
+# ============================================================================
+
+BASE_DIR = Path(__file__).parent / "data"
+WORKSPACES_DIR = BASE_DIR / "workspaces"
+MODELS_DIR = BASE_DIR / "models"
+UPLOADS_DIR = BASE_DIR / "uploads"
+DB_PATH = BASE_DIR / "vrungpu.db"
+
+# 디렉토리 생성
+for d in [BASE_DIR, WORKSPACES_DIR, MODELS_DIR, UPLOADS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================================
+# Database Schema & Operations
+# ============================================================================
+
+def init_database():
+    """데이터베이스 초기화"""
+    with get_db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                name TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                task_type TEXT DEFAULT 'training',
+                gpu_id INTEGER,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                stdout TEXT,
+                stderr TEXT,
+                return_code INTEGER,
+                error TEXT,
+                work_dir TEXT,
+                entry_point TEXT,
+                config TEXT,
+                progress REAL DEFAULT 0,
+                progress_message TEXT,
+                model_id TEXT,
+                parent_task_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS models (
+                model_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                task_id TEXT,
+                model_type TEXT,
+                framework TEXT DEFAULT 'pytorch',
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                model_path TEXT,
+                config TEXT,
+                metrics TEXT,
+                description TEXT,
+                status TEXT DEFAULT 'ready',
+                file_size INTEGER,
+                FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS inference_logs (
+                log_id TEXT PRIMARY KEY,
+                model_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                input_data TEXT,
+                output_data TEXT,
+                latency_ms REAL,
+                gpu_id INTEGER,
+                status TEXT,
+                error TEXT,
+                FOREIGN KEY (model_id) REFERENCES models(model_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_created ON tasks(created_at);
+            CREATE INDEX IF NOT EXISTS idx_models_task ON models(task_id);
+        """)
+
+
+@contextmanager
+def get_db():
+    """데이터베이스 연결 컨텍스트 매니저"""
+    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ============================================================================
+# Models (Pydantic)
+# ============================================================================
 
 class TaskStatus(str, Enum):
     PENDING = "pending"
@@ -30,11 +135,20 @@ class TaskStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class TaskType(str, Enum):
+    TRAINING = "training"
+    INFERENCE = "inference"
+    EVALUATION = "evaluation"
 
 
 class TaskResult(BaseModel):
     task_id: str
+    name: str | None = None
     status: TaskStatus
+    task_type: TaskType = TaskType.TRAINING
     gpu_id: int | None = None
     created_at: datetime
     started_at: datetime | None = None
@@ -44,12 +158,42 @@ class TaskResult(BaseModel):
     return_code: int | None = None
     error: str | None = None
     work_dir: str | None = None
+    entry_point: str | None = None
+    config: dict | None = None
+    progress: float = 0
+    progress_message: str | None = None
+    model_id: str | None = None
+
+
+class ModelInfo(BaseModel):
+    model_id: str
+    name: str
+    task_id: str | None = None
+    model_type: str | None = None
+    framework: str = "pytorch"
+    created_at: datetime
+    updated_at: datetime | None = None
+    model_path: str | None = None
+    config: dict | None = None
+    metrics: dict | None = None
+    description: str | None = None
+    status: str = "ready"
+    file_size: int | None = None
 
 
 class CodeRequest(BaseModel):
     code: str = Field(..., description="실행할 Python 코드")
-    timeout: int = Field(default=300, description="타임아웃 (초)", ge=1, le=3600)
-    gpu_id: int | None = Field(default=None, description="사용할 GPU ID (None이면 자동 할당)")
+    name: str | None = Field(default=None, description="작업 이름")
+    timeout: int = Field(default=300, description="타임아웃 (초)", ge=1, le=86400)
+    gpu_id: int | None = Field(default=None, description="사용할 GPU ID")
+    save_model: bool = Field(default=False, description="학습 완료 후 모델 저장")
+    model_name: str | None = Field(default=None, description="저장할 모델 이름")
+
+
+class InferenceRequest(BaseModel):
+    input_data: Any = Field(..., description="추론 입력 데이터")
+    gpu_id: int | None = Field(default=None, description="사용할 GPU ID")
+    timeout: int = Field(default=60, description="타임아웃 (초)")
 
 
 class AsyncTaskResponse(BaseModel):
@@ -70,6 +214,15 @@ class GPUPoolStatus(BaseModel):
     available_gpus: list[int]
     busy_gpus: dict[str, int]
 
+
+class ProgressUpdate(BaseModel):
+    progress: float = Field(..., ge=0, le=100, description="진행률 (0-100)")
+    message: str | None = Field(default=None, description="진행 상태 메시지")
+
+
+# ============================================================================
+# GPU Pool Manager
+# ============================================================================
 
 class GPUPool:
     """GPU 풀 관리자"""
@@ -127,17 +280,161 @@ class GPUPool:
             }
 
 
-# 전역 객체
-tasks: dict[str, TaskResult] = {}
+# ============================================================================
+# Database Task Operations
+# ============================================================================
+
+def save_task(task: TaskResult):
+    """작업을 DB에 저장"""
+    with get_db() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO tasks
+            (task_id, name, status, task_type, gpu_id, created_at, started_at,
+             completed_at, stdout, stderr, return_code, error, work_dir,
+             entry_point, config, progress, progress_message, model_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            task.task_id, task.name, task.status.value, task.task_type.value,
+            task.gpu_id, task.created_at.isoformat(),
+            task.started_at.isoformat() if task.started_at else None,
+            task.completed_at.isoformat() if task.completed_at else None,
+            task.stdout, task.stderr, task.return_code, task.error,
+            task.work_dir, task.entry_point,
+            json.dumps(task.config) if task.config else None,
+            task.progress, task.progress_message, task.model_id
+        ))
+
+
+def get_task(task_id: str) -> TaskResult | None:
+    """DB에서 작업 조회"""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if row:
+            return _row_to_task(row)
+    return None
+
+
+def get_tasks(limit: int = 50, status: str | None = None, task_type: str | None = None) -> list[TaskResult]:
+    """작업 목록 조회"""
+    with get_db() as conn:
+        query = "SELECT * FROM tasks WHERE 1=1"
+        params = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        if task_type:
+            query += " AND task_type = ?"
+            params.append(task_type)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [_row_to_task(row) for row in rows]
+
+
+def _row_to_task(row) -> TaskResult:
+    """DB row를 TaskResult로 변환"""
+    return TaskResult(
+        task_id=row["task_id"],
+        name=row["name"],
+        status=TaskStatus(row["status"]),
+        task_type=TaskType(row["task_type"]) if row["task_type"] else TaskType.TRAINING,
+        gpu_id=row["gpu_id"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
+        completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
+        stdout=row["stdout"],
+        stderr=row["stderr"],
+        return_code=row["return_code"],
+        error=row["error"],
+        work_dir=row["work_dir"],
+        entry_point=row["entry_point"],
+        config=json.loads(row["config"]) if row["config"] else None,
+        progress=row["progress"] or 0,
+        progress_message=row["progress_message"],
+        model_id=row["model_id"],
+    )
+
+
+# ============================================================================
+# Model Operations
+# ============================================================================
+
+def save_model(model: ModelInfo):
+    """모델을 DB에 저장"""
+    with get_db() as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO models
+            (model_id, name, task_id, model_type, framework, created_at, updated_at,
+             model_path, config, metrics, description, status, file_size)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            model.model_id, model.name, model.task_id, model.model_type,
+            model.framework, model.created_at.isoformat(),
+            model.updated_at.isoformat() if model.updated_at else None,
+            model.model_path,
+            json.dumps(model.config) if model.config else None,
+            json.dumps(model.metrics) if model.metrics else None,
+            model.description, model.status, model.file_size
+        ))
+
+
+def get_model(model_id: str) -> ModelInfo | None:
+    """DB에서 모델 조회"""
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM models WHERE model_id = ?", (model_id,)).fetchone()
+        if row:
+            return _row_to_model(row)
+    return None
+
+
+def get_models(limit: int = 50, status: str | None = None) -> list[ModelInfo]:
+    """모델 목록 조회"""
+    with get_db() as conn:
+        query = "SELECT * FROM models WHERE 1=1"
+        params = []
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = conn.execute(query, params).fetchall()
+        return [_row_to_model(row) for row in rows]
+
+
+def _row_to_model(row) -> ModelInfo:
+    """DB row를 ModelInfo로 변환"""
+    return ModelInfo(
+        model_id=row["model_id"],
+        name=row["name"],
+        task_id=row["task_id"],
+        model_type=row["model_type"],
+        framework=row["framework"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]) if row["updated_at"] else None,
+        model_path=row["model_path"],
+        config=json.loads(row["config"]) if row["config"] else None,
+        metrics=json.loads(row["metrics"]) if row["metrics"] else None,
+        description=row["description"],
+        status=row["status"],
+        file_size=row["file_size"],
+    )
+
+
+# ============================================================================
+# Global Objects
+# ============================================================================
+
 gpu_pool = GPUPool()
 websocket_clients: set[WebSocket] = set()
-WORK_DIR_BASE = Path(tempfile.gettempdir()) / "vrungpu_workspaces"
-WORK_DIR_BASE.mkdir(exist_ok=True)
+running_tasks: dict[str, TaskResult] = {}  # 메모리 캐시 (실행 중인 작업만)
+
+# 데이터베이스 초기화
+init_database()
 
 app = FastAPI(
     title="VrunGPU",
-    description="원격 GPU 학습/추론 실행 서버 (멀티 GPU + WebSocket 스트리밍)",
-    version="0.3.0",
+    description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리)",
+    version="0.4.0",
 )
 
 app.add_middleware(
@@ -148,6 +445,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================================================
+# WebSocket & Broadcasting
+# ============================================================================
 
 async def broadcast(message: dict):
     """모든 WebSocket 클라이언트에 메시지 전송"""
@@ -166,7 +467,9 @@ async def broadcast_task_update(task: TaskResult):
         "type": "task_update",
         "task": {
             "task_id": task.task_id,
+            "name": task.name,
             "status": task.status.value,
+            "task_type": task.task_type.value,
             "gpu_id": task.gpu_id,
             "created_at": task.created_at.isoformat(),
             "started_at": task.started_at.isoformat() if task.started_at else None,
@@ -175,6 +478,9 @@ async def broadcast_task_update(task: TaskResult):
             "stderr": task.stderr,
             "return_code": task.return_code,
             "error": task.error,
+            "progress": task.progress,
+            "progress_message": task.progress_message,
+            "model_id": task.model_id,
         }
     })
 
@@ -231,46 +537,25 @@ def get_gpu_info() -> GPUInfo:
         return GPUInfo(available=False, error=str(e))
 
 
-def execute_in_workdir(
-    work_dir: Path,
-    entry_point: str,
-    timeout: int = 300,
-    gpu_id: int | None = None
-) -> tuple[str, str, int]:
-    """작업 디렉토리에서 Python 스크립트 실행"""
-    env = os.environ.copy()
-    if gpu_id is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-    script_path = work_dir / entry_point
-    if not script_path.exists():
-        return "", f"Entry point not found: {entry_point}", -1
-
-    try:
-        result = subprocess.run(
-            [sys.executable, str(script_path)],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(work_dir),
-            env=env,
-        )
-        return result.stdout, result.stderr, result.returncode
-    except subprocess.TimeoutExpired:
-        return "", f"Timeout after {timeout} seconds", -1
-    except Exception as e:
-        return "", str(e), -1
-
+# ============================================================================
+# Task Execution
+# ============================================================================
 
 async def run_task_with_streaming(
     task_id: str,
     work_dir: Path,
     entry_point: str,
     timeout: int,
-    gpu_id: int | None
+    gpu_id: int | None,
+    save_model: bool = False,
+    model_name: str | None = None,
 ):
     """실시간 스트리밍과 함께 작업 실행"""
-    task = tasks[task_id]
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        return
+
+    running_tasks[task_id] = task
 
     # GPU 할당 대기
     assigned_gpu = None
@@ -278,18 +563,22 @@ async def run_task_with_streaming(
         assigned_gpu = gpu_pool.acquire(task_id, gpu_id)
         if assigned_gpu is None:
             task.status = TaskStatus.QUEUED
+            save_task(task)
             await broadcast_task_update(task)
             await asyncio.sleep(1)
 
     task.gpu_id = assigned_gpu
     task.status = TaskStatus.RUNNING
     task.started_at = datetime.now()
+    save_task(task)
     await broadcast_task_update(task)
     await broadcast_gpu_update()
 
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
     env["PYTHONUNBUFFERED"] = "1"
+    env["VRUNGPU_TASK_ID"] = task_id
+    env["VRUNGPU_MODEL_DIR"] = str(MODELS_DIR)
 
     script_path = work_dir / entry_point
     stdout_lines = []
@@ -311,6 +600,17 @@ async def run_task_with_streaming(
                     break
                 decoded = line.decode("utf-8", errors="replace")
                 lines.append(decoded)
+
+                # 진행률 파싱 (특별한 형식: [PROGRESS:50.5:Training epoch 5/10])
+                if decoded.startswith("[PROGRESS:"):
+                    try:
+                        parts = decoded[10:-2].split(":", 1)
+                        task.progress = float(parts[0])
+                        task.progress_message = parts[1] if len(parts) > 1 else None
+                        save_task(task)
+                    except:
+                        pass
+
                 # 실시간 스트리밍
                 await broadcast({
                     "type": "task_output",
@@ -339,16 +639,66 @@ async def run_task_with_streaming(
         task.stderr = "".join(stderr_lines)
         task.return_code = return_code
         task.status = TaskStatus.COMPLETED if return_code == 0 else TaskStatus.FAILED
+        task.progress = 100 if return_code == 0 else task.progress
+
+        # 모델 저장 처리
+        if save_model and return_code == 0:
+            await _save_trained_model(task, work_dir, model_name)
 
     except Exception as e:
         task.status = TaskStatus.FAILED
         task.error = str(e)
     finally:
         task.completed_at = datetime.now()
+        save_task(task)
         gpu_pool.release(assigned_gpu)
+        running_tasks.pop(task_id, None)
         await broadcast_task_update(task)
         await broadcast_gpu_update()
 
+
+async def _save_trained_model(task: TaskResult, work_dir: Path, model_name: str | None):
+    """학습 완료된 모델 저장"""
+    model_id = str(uuid.uuid4())[:8]
+    model_dir = MODELS_DIR / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    # 모델 파일 찾기 (.pt, .pth, .onnx, .h5, .pkl)
+    model_extensions = [".pt", ".pth", ".onnx", ".h5", ".pkl", ".bin", ".safetensors"]
+    model_files = []
+    for ext in model_extensions:
+        model_files.extend(work_dir.rglob(f"*{ext}"))
+
+    total_size = 0
+    for mf in model_files:
+        dest = model_dir / mf.name
+        shutil.copy2(mf, dest)
+        total_size += dest.stat().st_size
+
+    # config 파일 복사
+    for cf in work_dir.rglob("*.json"):
+        if "config" in cf.name.lower():
+            shutil.copy2(cf, model_dir / cf.name)
+
+    model = ModelInfo(
+        model_id=model_id,
+        name=model_name or f"model_{task.task_id[:8]}",
+        task_id=task.task_id,
+        model_type="pytorch",
+        framework="pytorch",
+        created_at=datetime.now(),
+        model_path=str(model_dir),
+        status="ready",
+        file_size=total_size,
+        description=f"Trained from task {task.task_id}",
+    )
+    save_model(model)
+    task.model_id = model_id
+
+
+# ============================================================================
+# API Endpoints - Core
+# ============================================================================
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -359,7 +709,7 @@ async def websocket_endpoint(websocket: WebSocket):
     # 초기 데이터 전송
     gpu_info = get_gpu_info()
     pool_status = gpu_pool.get_status()
-    sorted_tasks = sorted(tasks.values(), key=lambda t: t.created_at, reverse=True)[:20]
+    recent_tasks = get_tasks(limit=20)
 
     await websocket.send_json({
         "type": "init",
@@ -368,7 +718,9 @@ async def websocket_endpoint(websocket: WebSocket):
         "tasks": [
             {
                 "task_id": t.task_id,
+                "name": t.name,
                 "status": t.status.value,
+                "task_type": t.task_type.value,
                 "gpu_id": t.gpu_id,
                 "created_at": t.created_at.isoformat(),
                 "started_at": t.started_at.isoformat() if t.started_at else None,
@@ -377,14 +729,15 @@ async def websocket_endpoint(websocket: WebSocket):
                 "stderr": t.stderr,
                 "return_code": t.return_code,
                 "error": t.error,
+                "progress": t.progress,
+                "progress_message": t.progress_message,
             }
-            for t in sorted_tasks
+            for t in recent_tasks
         ],
     })
 
     try:
         while True:
-            # 주기적으로 GPU 상태 업데이트
             await asyncio.sleep(2)
             await broadcast_gpu_update()
     except WebSocketDisconnect:
@@ -396,12 +749,22 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/")
 async def root():
     pool_status = gpu_pool.get_status()
+    with get_db() as conn:
+        total_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        total_models = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
     return {
         "service": "VrunGPU",
         "status": "running",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "gpu_count": pool_status["total_gpus"],
         "available_gpus": len(pool_status["available_gpus"]),
+        "total_tasks": total_tasks,
+        "total_models": total_models,
+        "storage": {
+            "workspaces": str(WORKSPACES_DIR),
+            "models": str(MODELS_DIR),
+            "database": str(DB_PATH),
+        }
     }
 
 
@@ -415,14 +778,17 @@ async def get_gpu_pool_status():
     return gpu_pool.get_status()
 
 
+# ============================================================================
+# API Endpoints - Tasks
+# ============================================================================
+
 @app.post("/run/sync", response_model=TaskResult)
 async def run_sync(request: CodeRequest):
-    """동기 실행"""
+    """동기 실행 (결과를 기다림)"""
     task_id = str(uuid.uuid4())
-    work_dir = WORK_DIR_BASE / task_id
+    work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
 
-    # 코드를 파일로 저장
     script_path = work_dir / "main.py"
     script_path.write_text(request.code)
 
@@ -433,22 +799,38 @@ async def run_sync(request: CodeRequest):
 
     task = TaskResult(
         task_id=task_id,
+        name=request.name or f"sync_{task_id[:8]}",
         status=TaskStatus.RUNNING,
+        task_type=TaskType.TRAINING,
         gpu_id=assigned_gpu,
         created_at=datetime.now(),
         started_at=datetime.now(),
         work_dir=str(work_dir),
+        entry_point="main.py",
     )
+    save_task(task)
+
+    env = os.environ.copy()
+    if assigned_gpu is not None:
+        env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
 
     try:
-        loop = asyncio.get_event_loop()
-        stdout, stderr, return_code = await loop.run_in_executor(
-            None, execute_in_workdir, work_dir, "main.py", request.timeout, assigned_gpu
+        result = subprocess.run(
+            [sys.executable, str(script_path)],
+            capture_output=True,
+            text=True,
+            timeout=request.timeout,
+            cwd=str(work_dir),
+            env=env,
         )
-        task.stdout = stdout
-        task.stderr = stderr
-        task.return_code = return_code
-        task.status = TaskStatus.COMPLETED if return_code == 0 else TaskStatus.FAILED
+        task.stdout = result.stdout
+        task.stderr = result.stderr
+        task.return_code = result.returncode
+        task.status = TaskStatus.COMPLETED if result.returncode == 0 else TaskStatus.FAILED
+        task.progress = 100 if result.returncode == 0 else 0
+    except subprocess.TimeoutExpired:
+        task.status = TaskStatus.FAILED
+        task.error = f"Timeout after {request.timeout} seconds"
     except Exception as e:
         task.status = TaskStatus.FAILED
         task.error = str(e)
@@ -456,16 +838,16 @@ async def run_sync(request: CodeRequest):
         task.completed_at = datetime.now()
         if assigned_gpu is not None:
             gpu_pool.release(assigned_gpu)
-        shutil.rmtree(work_dir, ignore_errors=True)
+        save_task(task)
 
     return task
 
 
 @app.post("/run/async", response_model=AsyncTaskResponse)
 async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
-    """비동기 실행"""
+    """비동기 실행 (즉시 반환, 백그라운드 실행)"""
     task_id = str(uuid.uuid4())
-    work_dir = WORK_DIR_BASE / task_id
+    work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
 
     script_path = work_dir / "main.py"
@@ -473,14 +855,19 @@ async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
 
     task = TaskResult(
         task_id=task_id,
+        name=request.name or f"async_{task_id[:8]}",
         status=TaskStatus.PENDING,
+        task_type=TaskType.TRAINING,
         created_at=datetime.now(),
         work_dir=str(work_dir),
+        entry_point="main.py",
     )
-    tasks[task_id] = task
+    save_task(task)
+    running_tasks[task_id] = task
 
     background_tasks.add_task(
-        run_task_with_streaming, task_id, work_dir, "main.py", request.timeout, request.gpu_id
+        run_task_with_streaming, task_id, work_dir, "main.py",
+        request.timeout, request.gpu_id, request.save_model, request.model_name
     )
 
     return AsyncTaskResponse(
@@ -492,19 +879,18 @@ async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
 
 @app.post("/run/project", response_model=AsyncTaskResponse)
 async def run_project(
-    file: UploadFile = File(..., description="ZIP 파일 (프로젝트 전체) 또는 단일 .py 파일"),
-    entry_point: str = Form(default="main.py", description="실행할 메인 파일 (예: train.py)"),
+    file: UploadFile = File(...),
+    name: str = Form(default=None),
+    entry_point: str = Form(default="main.py"),
     timeout: int = Form(default=300),
     gpu_id: int | None = Form(default=None),
+    save_model: bool = Form(default=False),
+    model_name: str | None = Form(default=None),
     background_tasks: BackgroundTasks = None,
 ):
-    """
-    프로젝트 업로드 후 실행
-    - ZIP 파일: 여러 Python 파일 + 데이터셋 포함 가능
-    - 단일 .py 파일: 간단한 스크립트 실행
-    """
+    """프로젝트 업로드 후 실행"""
     task_id = str(uuid.uuid4())
-    work_dir = WORK_DIR_BASE / task_id
+    work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
 
     filename = file.filename or "upload"
@@ -512,14 +898,12 @@ async def run_project(
 
     try:
         if filename.endswith(".zip"):
-            # ZIP 파일 압축 해제
             zip_path = work_dir / "upload.zip"
             zip_path.write_bytes(content)
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(work_dir)
             zip_path.unlink()
 
-            # 최상위에 단일 폴더만 있으면 그 안의 내용을 올림
             items = list(work_dir.iterdir())
             if len(items) == 1 and items[0].is_dir():
                 nested_dir = items[0]
@@ -528,7 +912,6 @@ async def run_project(
                 nested_dir.rmdir()
 
         elif filename.endswith(".py"):
-            # 단일 Python 파일
             script_path = work_dir / filename
             script_path.write_bytes(content)
             entry_point = filename
@@ -536,7 +919,6 @@ async def run_project(
             shutil.rmtree(work_dir, ignore_errors=True)
             raise HTTPException(status_code=400, detail="ZIP 또는 .py 파일만 지원합니다.")
 
-        # entry_point 파일 존재 확인
         if not (work_dir / entry_point).exists():
             files = [f.name for f in work_dir.rglob("*.py")]
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -551,14 +933,19 @@ async def run_project(
 
     task = TaskResult(
         task_id=task_id,
+        name=name or f"project_{task_id[:8]}",
         status=TaskStatus.PENDING,
+        task_type=TaskType.TRAINING,
         created_at=datetime.now(),
         work_dir=str(work_dir),
+        entry_point=entry_point,
     )
-    tasks[task_id] = task
+    save_task(task)
+    running_tasks[task_id] = task
 
     background_tasks.add_task(
-        run_task_with_streaming, task_id, work_dir, entry_point, timeout, gpu_id
+        run_task_with_streaming, task_id, work_dir, entry_point,
+        timeout, gpu_id, save_model, model_name
     )
 
     return AsyncTaskResponse(
@@ -570,31 +957,310 @@ async def run_project(
 
 @app.get("/task/{task_id}", response_model=TaskResult)
 async def get_task_status(task_id: str):
-    if task_id not in tasks:
+    """작업 상태 조회"""
+    # 먼저 실행 중인 작업 캐시에서 확인
+    if task_id in running_tasks:
+        return running_tasks[task_id]
+    # DB에서 조회
+    task = get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
-    return tasks[task_id]
+    return task
 
 
 @app.get("/tasks", response_model=list[TaskResult])
-async def list_tasks(limit: int = 20):
-    sorted_tasks = sorted(
-        tasks.values(), key=lambda t: t.created_at, reverse=True
-    )
-    return sorted_tasks[:limit]
+async def list_tasks(
+    limit: int = Query(default=50, le=200),
+    status: str | None = Query(default=None),
+    task_type: str | None = Query(default=None),
+):
+    """작업 목록 조회"""
+    return get_tasks(limit=limit, status=status, task_type=task_type)
+
+
+@app.put("/task/{task_id}/progress")
+async def update_task_progress(task_id: str, update: ProgressUpdate):
+    """작업 진행률 업데이트 (외부에서 호출 가능)"""
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+
+    task.progress = update.progress
+    task.progress_message = update.message
+    save_task(task)
+    await broadcast_task_update(task)
+
+    return {"message": "Progress updated", "progress": update.progress}
 
 
 @app.delete("/task/{task_id}")
 async def delete_task(task_id: str):
-    if task_id not in tasks:
+    """작업 삭제"""
+    task = get_task(task_id)
+    if not task:
         raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
-    task = tasks[task_id]
+
     if task.work_dir:
         shutil.rmtree(task.work_dir, ignore_errors=True)
-    del tasks[task_id]
+
+    with get_db() as conn:
+        conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+
+    running_tasks.pop(task_id, None)
     return {"message": "작업이 삭제되었습니다."}
 
 
+# ============================================================================
+# API Endpoints - Models
+# ============================================================================
+
+@app.get("/models", response_model=list[ModelInfo])
+async def list_models(
+    limit: int = Query(default=50, le=200),
+    status: str | None = Query(default=None),
+):
+    """모델 목록 조회"""
+    return get_models(limit=limit, status=status)
+
+
+@app.get("/model/{model_id}", response_model=ModelInfo)
+async def get_model_info(model_id: str):
+    """모델 상세 정보 조회"""
+    model = get_model(model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="모델을 찾을 수 없습니다.")
+    return model
+
+
+@app.post("/model/{model_id}/inference", response_model=AsyncTaskResponse)
+async def run_inference(
+    model_id: str,
+    request: InferenceRequest,
+    background_tasks: BackgroundTasks,
+):
+    """모델로 추론 실행"""
+    model = get_model(model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="모델을 찾을 수 없습니다.")
+
+    if model.status != "ready":
+        raise HTTPException(status_code=400, detail="모델이 준비되지 않았습니다.")
+
+    task_id = str(uuid.uuid4())
+    work_dir = WORKSPACES_DIR / f"inference_{task_id}"
+    work_dir.mkdir(parents=True)
+
+    # 추론 스크립트 생성
+    inference_script = f'''
+import json
+import sys
+import torch
+from pathlib import Path
+
+MODEL_PATH = Path("{model.model_path}")
+INPUT_DATA = {json.dumps(request.input_data)}
+
+def load_model():
+    """모델 로드 (사용자 정의 필요)"""
+    model_files = list(MODEL_PATH.glob("*.pt")) + list(MODEL_PATH.glob("*.pth"))
+    if model_files:
+        return torch.load(model_files[0], map_location="cuda" if torch.cuda.is_available() else "cpu")
+    raise FileNotFoundError("No model file found")
+
+def run_inference(model, input_data):
+    """추론 실행 (사용자 정의 필요)"""
+    # 기본 구현: 입력 데이터를 텐서로 변환하여 모델에 전달
+    if hasattr(model, 'eval'):
+        model.eval()
+    with torch.no_grad():
+        if isinstance(input_data, list):
+            input_tensor = torch.tensor(input_data)
+            if torch.cuda.is_available():
+                input_tensor = input_tensor.cuda()
+            output = model(input_tensor)
+            return output.cpu().tolist() if hasattr(output, 'cpu') else output
+    return {{"message": "Inference completed", "input": input_data}}
+
+if __name__ == "__main__":
+    try:
+        model = load_model()
+        result = run_inference(model, INPUT_DATA)
+        print(json.dumps({{"success": True, "result": result}}))
+    except Exception as e:
+        print(json.dumps({{"success": False, "error": str(e)}}), file=sys.stderr)
+        sys.exit(1)
+'''
+
+    script_path = work_dir / "inference.py"
+    script_path.write_text(inference_script)
+
+    task = TaskResult(
+        task_id=task_id,
+        name=f"inference_{model.name}",
+        status=TaskStatus.PENDING,
+        task_type=TaskType.INFERENCE,
+        created_at=datetime.now(),
+        work_dir=str(work_dir),
+        entry_point="inference.py",
+        model_id=model_id,
+        config={"input_data": request.input_data},
+    )
+    save_task(task)
+    running_tasks[task_id] = task
+
+    background_tasks.add_task(
+        run_task_with_streaming, task_id, work_dir, "inference.py",
+        request.timeout, request.gpu_id, False, None
+    )
+
+    return AsyncTaskResponse(
+        task_id=task_id,
+        status=TaskStatus.PENDING,
+        message=f"추론 작업이 시작되었습니다. Model: {model.name}",
+    )
+
+
+@app.post("/model/register", response_model=ModelInfo)
+async def register_model(
+    name: str = Form(...),
+    model_file: UploadFile = File(...),
+    model_type: str = Form(default="pytorch"),
+    framework: str = Form(default="pytorch"),
+    description: str | None = Form(default=None),
+):
+    """외부 모델 등록"""
+    model_id = str(uuid.uuid4())[:8]
+    model_dir = MODELS_DIR / model_id
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    content = await model_file.read()
+    model_path = model_dir / (model_file.filename or "model.pt")
+    model_path.write_bytes(content)
+
+    model = ModelInfo(
+        model_id=model_id,
+        name=name,
+        model_type=model_type,
+        framework=framework,
+        created_at=datetime.now(),
+        model_path=str(model_dir),
+        description=description,
+        status="ready",
+        file_size=len(content),
+    )
+    save_model(model)
+
+    return model
+
+
+@app.delete("/model/{model_id}")
+async def delete_model(model_id: str):
+    """모델 삭제"""
+    model = get_model(model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="모델을 찾을 수 없습니다.")
+
+    if model.model_path:
+        shutil.rmtree(model.model_path, ignore_errors=True)
+
+    with get_db() as conn:
+        conn.execute("DELETE FROM models WHERE model_id = ?", (model_id,))
+
+    return {"message": "모델이 삭제되었습니다."}
+
+
+@app.get("/model/{model_id}/download")
+async def download_model(model_id: str):
+    """모델 파일 다운로드"""
+    model = get_model(model_id)
+    if not model:
+        raise HTTPException(status_code=404, detail="모델을 찾을 수 없습니다.")
+
+    if not model.model_path:
+        raise HTTPException(status_code=404, detail="모델 경로가 없습니다.")
+
+    model_dir = Path(model.model_path)
+    model_files = list(model_dir.glob("*.pt")) + list(model_dir.glob("*.pth"))
+
+    if not model_files:
+        raise HTTPException(status_code=404, detail="모델 파일이 없습니다.")
+
+    return FileResponse(
+        model_files[0],
+        filename=model_files[0].name,
+        media_type="application/octet-stream"
+    )
+
+
+# ============================================================================
+# API Endpoints - Statistics
+# ============================================================================
+
+@app.get("/stats")
+async def get_statistics():
+    """통계 정보 조회"""
+    with get_db() as conn:
+        # 작업 통계
+        task_stats = conn.execute("""
+            SELECT
+                status,
+                COUNT(*) as count,
+                AVG(CASE WHEN completed_at IS NOT NULL AND started_at IS NOT NULL
+                    THEN (julianday(completed_at) - julianday(started_at)) * 86400
+                    ELSE NULL END) as avg_duration_sec
+            FROM tasks
+            GROUP BY status
+        """).fetchall()
+
+        # 최근 24시간 작업 수
+        recent_tasks = conn.execute("""
+            SELECT COUNT(*) FROM tasks
+            WHERE created_at > datetime('now', '-24 hours')
+        """).fetchone()[0]
+
+        # 모델 통계
+        model_stats = conn.execute("""
+            SELECT status, COUNT(*) as count
+            FROM models
+            GROUP BY status
+        """).fetchall()
+
+        # GPU 사용 통계
+        gpu_usage = conn.execute("""
+            SELECT gpu_id, COUNT(*) as count
+            FROM tasks
+            WHERE gpu_id IS NOT NULL
+            GROUP BY gpu_id
+        """).fetchall()
+
+    return {
+        "tasks": {
+            "by_status": {row["status"]: row["count"] for row in task_stats},
+            "avg_duration": {
+                row["status"]: round(row["avg_duration_sec"], 2) if row["avg_duration_sec"] else None
+                for row in task_stats
+            },
+            "last_24h": recent_tasks,
+        },
+        "models": {
+            "by_status": {row["status"]: row["count"] for row in model_stats},
+            "total": sum(row["count"] for row in model_stats),
+        },
+        "gpu": {
+            "usage_count": {f"gpu_{row['gpu_id']}": row["count"] for row in gpu_usage},
+            "current": gpu_pool.get_status(),
+        }
+    }
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
 if __name__ == "__main__":
     import uvicorn
-    print(f"VrunGPU Server v0.3.0 starting with {gpu_pool.gpu_count} GPUs")
+    print(f"VrunGPU Server v0.4.0 starting with {gpu_pool.gpu_count} GPUs")
+    print(f"Database: {DB_PATH}")
+    print(f"Workspaces: {WORKSPACES_DIR}")
+    print(f"Models: {MODELS_DIR}")
     uvicorn.run(app, host="0.0.0.0", port=9825)

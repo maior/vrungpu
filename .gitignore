@@ -44,6 +44,9 @@ tmp/
 temp/
 uploads/
 
+# VrunGPU Data (SQLite, workspaces, models)
+data/
+
 # Environment
 .env
 .env.local
