@@ -91,20 +91,18 @@ curl http://your-server:9825/
 curl -X POST http://your-server:9825/run/sync \
   -H "Content-Type: application/json" \
   -d '{
-    "code": "import torch\nprint(torch.cuda.get_device_name(0))",
-    "timeout": 30
+    "code": "import torch\nprint(torch.cuda.get_device_name(0))"
   }'
 ```
 
 ### 3. Asynchronous Execution (Long Training)
 
 ```bash
-# Submit job
+# Submit job - runs until completion (no timeout by default)
 curl -X POST http://your-server:9825/run/async \
   -H "Content-Type: application/json" \
   -d '{
-    "code": "import time\nfor i in range(10):\n    print(f\"Step {i+1}/10\")\n    time.sleep(1)",
-    "timeout": 300
+    "code": "import time\nfor i in range(10):\n    print(f\"Step {i+1}/10\")\n    time.sleep(1)"
   }'
 
 # Response: {"task_id": "abc-123", "status": "pending", ...}
@@ -112,6 +110,8 @@ curl -X POST http://your-server:9825/run/async \
 # Check status
 curl http://your-server:9825/task/abc-123
 ```
+
+> **Note:** By default, tasks run without timeout. Training can run for hours or days. To set a timeout, add `"timeout": 3600` (seconds).
 
 ### 4. Specify GPU
 
@@ -351,8 +351,7 @@ zip -r ../my_project.zip .
 ```bash
 curl -X POST http://your-server:9825/run/project \
   -F "file=@my_project.zip" \
-  -F "entry_point=train.py" \
-  -F "timeout=3600"
+  -F "entry_point=train.py"
 ```
 
 **Using Python:**
@@ -365,7 +364,6 @@ with open("my_project.zip", "rb") as f:
         files={"file": f},
         data={
             "entry_point": "train.py",
-            "timeout": 3600,
             "gpu_id": 0  # Optional: specify GPU
         }
     )
@@ -373,6 +371,8 @@ with open("my_project.zip", "rb") as f:
 task_id = response.json()["task_id"]
 print(f"Task started: {task_id}")
 ```
+
+> **Note:** No timeout by default. Add `"timeout": 3600` if you want to limit execution time.
 
 **Using Dashboard:**
 1. Go to http://your-server:9824
@@ -561,11 +561,10 @@ vrungpu/
 cd examples
 zip -r mnist_project.zip mnist_project/
 
-# Upload and run
+# Upload and run (no timeout - runs until completion)
 curl -X POST http://your-server:9825/run/project \
   -F "file=@mnist_project.zip" \
-  -F "entry_point=train.py" \
-  -F "timeout=300"
+  -F "entry_point=train.py"
 ```
 
 ### 2. Monitor Progress
