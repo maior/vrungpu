@@ -128,37 +128,62 @@ curl -X POST http://your-server:9825/run/sync \
 
 ## Progress Tracking
 
-Report training progress from your code and monitor it in real-time.
+Report training and evaluation progress from your code and monitor it in real-time.
 
 ### Progress Output Format
 
 ```python
-# Print progress in this format from your training code
+# Print progress in this format from your code
 print(f"[PROGRESS:{progress_percent}:{message}]")
 ```
 
-### Example Training Code
+### Example: Training + Evaluation Progress
 
 ```python
 import torch
 import torch.nn as nn
 
-# Start training
+# === Training Phase (0-85%) ===
 print("[PROGRESS:0:Training started]")
 
-for epoch in range(1, 11):
-    # Training logic...
-    loss = train_one_epoch()
+num_epochs = 3
+for epoch in range(1, num_epochs + 1):
+    for batch_idx, batch in enumerate(train_loader):
+        # Training logic...
+        loss = train_step(batch)
 
-    # Report progress (10%, 20%, ... 100%)
-    progress = epoch * 10
-    print(f"[PROGRESS:{progress}:Epoch {epoch}/10, Loss: {loss:.4f}]")
+        # Report every 100 batches
+        if batch_idx % 100 == 0:
+            progress = int((epoch - 1 + batch_idx / len(train_loader)) / num_epochs * 85)
+            print(f"[PROGRESS:{progress}:Epoch {epoch} Batch {batch_idx}, Loss: {loss:.4f}]")
+
+# === Evaluation Phase (85-95%) ===
+print("[PROGRESS:85:Evaluating...]")
+model.eval()
+
+with torch.no_grad():
+    for batch_idx, batch in enumerate(eval_loader):
+        # Evaluation logic...
+        evaluate_step(batch)
+
+        # Report every 10 batches
+        if batch_idx % 10 == 0:
+            progress = 85 + int((batch_idx + 1) / len(eval_loader) * 10)
+            print(f"[PROGRESS:{progress}:Eval {batch_idx+1}/{len(eval_loader)}]")
+
+# === Save Model (95-100%) ===
+print("[PROGRESS:95:Saving model...]")
+torch.save(model.state_dict(), "model.pt")
 
 print("[PROGRESS:100:Training complete!]")
-
-# Save model
-torch.save(model.state_dict(), "model.pt")
 ```
+
+**Recommended Progress Allocation:**
+| Phase | Progress Range | Description |
+|-------|---------------|-------------|
+| Training | 0-85% | Main training loop |
+| Evaluation | 85-95% | Validation/test evaluation |
+| Saving | 95-100% | Model checkpoint & results |
 
 ### Query Progress
 
