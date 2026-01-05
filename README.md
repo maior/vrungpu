@@ -6,6 +6,10 @@ Remote GPU execution server for training and inference. Send Python code from yo
 
 ![VrunGPU Dashboard](docs/images/dashboard.png)
 
+### Demo Video
+
+[![VrunGPU Demo](https://img.youtube.com/vi/NhjQtNnod5o/maxresdefault.jpg)](https://youtu.be/NhjQtNnod5o)
+
 ## Features
 
 - **Sync/Async Execution**: Sync for quick tasks, async for long training jobs
