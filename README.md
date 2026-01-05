@@ -4,6 +4,8 @@ Remote GPU execution server for training and inference. Send Python code from yo
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
+![VrunGPU Dashboard](docs/images/dashboard.png)
+
 ## Features
 
 - **Sync/Async Execution**: Sync for quick tasks, async for long training jobs
