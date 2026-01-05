@@ -185,7 +185,7 @@ class ModelInfo(BaseModel):
 class CodeRequest(BaseModel):
     code: str = Field(..., description="실행할 Python 코드")
     name: str | None = Field(default=None, description="작업 이름")
-    timeout: int = Field(default=300, description="타임아웃 (초)", ge=1, le=86400)
+    timeout: int | None = Field(default=None, description="타임아웃 (초), None=무제한")
     gpu_id: int | None = Field(default=None, description="사용할 GPU ID")
     save_model: bool = Field(default=False, description="학습 완료 후 모델 저장")
     model_name: str | None = Field(default=None, description="저장할 모델 이름")
@@ -194,7 +194,7 @@ class CodeRequest(BaseModel):
 class InferenceRequest(BaseModel):
     input_data: Any = Field(..., description="추론 입력 데이터")
     gpu_id: int | None = Field(default=None, description="사용할 GPU ID")
-    timeout: int = Field(default=60, description="타임아웃 (초)")
+    timeout: int | None = Field(default=None, description="타임아웃 (초), None=무제한")
 
 
 class AsyncTaskResponse(BaseModel):
@@ -546,7 +546,7 @@ async def run_task_with_streaming(
     task_id: str,
     work_dir: Path,
     entry_point: str,
-    timeout: int,
+    timeout: int | None,
     gpu_id: int | None,
     save_model: bool = False,
     model_name: str | None = None,
@@ -621,13 +621,14 @@ async def run_task_with_streaming(
                 })
 
         try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    read_stream(process.stdout, stdout_lines, "stdout"),
-                    read_stream(process.stderr, stderr_lines, "stderr"),
-                ),
-                timeout=timeout
+            gather_task = asyncio.gather(
+                read_stream(process.stdout, stdout_lines, "stdout"),
+                read_stream(process.stderr, stderr_lines, "stderr"),
             )
+            if timeout:
+                await asyncio.wait_for(gather_task, timeout=timeout)
+            else:
+                await gather_task  # 무제한 실행
             await process.wait()
             return_code = process.returncode
         except asyncio.TimeoutError:
@@ -820,7 +821,7 @@ async def run_sync(request: CodeRequest):
             [sys.executable, str(script_path)],
             capture_output=True,
             text=True,
-            timeout=request.timeout,
+            timeout=request.timeout if request.timeout else None,
             cwd=str(work_dir),
             env=env,
         )
@@ -831,7 +832,7 @@ async def run_sync(request: CodeRequest):
         task.progress = 100 if result.returncode == 0 else 0
     except subprocess.TimeoutExpired:
         task.status = TaskStatus.FAILED
-        task.error = f"Timeout after {request.timeout} seconds"
+        task.error = f"Timeout after {request.timeout} seconds" if request.timeout else "Timeout"
     except Exception as e:
         task.status = TaskStatus.FAILED
         task.error = str(e)
@@ -883,13 +884,13 @@ async def run_project(
     file: UploadFile = File(...),
     name: str = Form(default=None),
     entry_point: str = Form(default="main.py"),
-    timeout: int = Form(default=300),
+    timeout: int | None = Form(default=None),
     gpu_id: int | None = Form(default=None),
     save_model: bool = Form(default=False),
     model_name: str | None = Form(default=None),
     background_tasks: BackgroundTasks = None,
 ):
-    """프로젝트 업로드 후 실행 (스트리밍 업로드 지원)"""
+    """프로젝트 업로드 후 실행 (스트리밍 업로드 지원, 타임아웃 무제한)"""
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
