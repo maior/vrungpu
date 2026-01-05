@@ -26,6 +26,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import aiofiles
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -888,18 +889,21 @@ async def run_project(
     model_name: str | None = Form(default=None),
     background_tasks: BackgroundTasks = None,
 ):
-    """프로젝트 업로드 후 실행"""
+    """프로젝트 업로드 후 실행 (스트리밍 업로드 지원)"""
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
 
     filename = file.filename or "upload"
-    content = await file.read()
 
     try:
         if filename.endswith(".zip"):
             zip_path = work_dir / "upload.zip"
-            zip_path.write_bytes(content)
+            # 스트리밍 업로드: 1MB 청크 단위로 파일 저장
+            async with aiofiles.open(zip_path, 'wb') as f:
+                while chunk := await file.read(1024 * 1024):  # 1MB chunks
+                    await f.write(chunk)
+
             with zipfile.ZipFile(zip_path, "r") as zf:
                 zf.extractall(work_dir)
             zip_path.unlink()
@@ -913,7 +917,10 @@ async def run_project(
 
         elif filename.endswith(".py"):
             script_path = work_dir / filename
-            script_path.write_bytes(content)
+            # 스트리밍 업로드
+            async with aiofiles.open(script_path, 'wb') as f:
+                while chunk := await file.read(1024 * 1024):
+                    await f.write(chunk)
             entry_point = filename
         else:
             shutil.rmtree(work_dir, ignore_errors=True)
@@ -1128,14 +1135,19 @@ async def register_model(
     framework: str = Form(default="pytorch"),
     description: str | None = Form(default=None),
 ):
-    """외부 모델 등록"""
+    """외부 모델 등록 (스트리밍 업로드 지원)"""
     model_id = str(uuid.uuid4())[:8]
     model_dir = MODELS_DIR / model_id
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    content = await model_file.read()
     model_path = model_dir / (model_file.filename or "model.pt")
-    model_path.write_bytes(content)
+
+    # 스트리밍 업로드: 1MB 청크 단위로 파일 저장
+    file_size = 0
+    async with aiofiles.open(model_path, 'wb') as f:
+        while chunk := await model_file.read(1024 * 1024):  # 1MB chunks
+            await f.write(chunk)
+            file_size += len(chunk)
 
     model = ModelInfo(
         model_id=model_id,
@@ -1146,7 +1158,7 @@ async def register_model(
         model_path=str(model_dir),
         description=description,
         status="ready",
-        file_size=len(content),
+        file_size=file_size,
     )
     save_model(model)
 
