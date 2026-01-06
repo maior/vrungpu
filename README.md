@@ -29,7 +29,29 @@ Remote GPU execution server for training and inference. Send Python code from yo
 - **Researchers** running ad-hoc experiments on remote GPU servers
 - **Anyone** tired of the SSH → git pull → run → copy results workflow
 
-> **Note:** VrunGPU is designed for experimentation and development. For production MLOps (CI/CD, A/B testing, feature stores), consider dedicated MLOps platforms. VrunGPU complements these tools by providing a lightweight execution layer.
+### When to use VrunGPU vs MLOps platforms
+
+| Scenario | MLOps Platforms | VrunGPU |
+|----------|----------------|---------|
+| Quick experiments / prototyping | Heavy setup overhead | ✅ Lightweight |
+| Ad-hoc GPU tasks | Pipeline setup required | ✅ Instant execution |
+| Small teams / individuals | Infrastructure cost | ✅ Minimal setup |
+| Production deployment | ✅ Recommended | Not designed for |
+| CI/CD pipelines | ✅ Recommended | Not designed for |
+| A/B testing / Feature stores | ✅ Recommended | Not designed for |
+
+### Where VrunGPU fits in your ML workflow
+
+```
+ML Development Lifecycle:
+
+[Idea] → [Experiment] → [Development] → [Production]
+              ↑               ↑               ↑
+          VrunGPU         VrunGPU          MLOps
+        (quick tests)   (iteration)    (deployment)
+```
+
+> **Note:** VrunGPU complements MLOps platforms by providing a lightweight execution layer for experimentation and development phases.
 
 ## Quick Start
 
