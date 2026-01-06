@@ -22,6 +22,15 @@ Remote GPU execution server for training and inference. Send Python code from yo
 - **Inference API**: Run inference on registered models
 - **Progress Tracking**: Real-time training progress monitoring
 
+## Who is this for?
+
+- **ML engineers** who want quick GPU experiments without infrastructure overhead
+- **Small teams** prototyping before building full MLOps pipelines
+- **Researchers** running ad-hoc experiments on remote GPU servers
+- **Anyone** tired of the SSH → git pull → run → copy results workflow
+
+> **Note:** VrunGPU is designed for experimentation and development. For production MLOps (CI/CD, A/B testing, feature stores), consider dedicated MLOps platforms. VrunGPU complements these tools by providing a lightweight execution layer.
+
 ## Quick Start
 
 ### Installation
