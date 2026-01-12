@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import aiofiles
+import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -42,6 +44,14 @@ WORKSPACES_DIR = BASE_DIR / "workspaces"
 MODELS_DIR = BASE_DIR / "models"
 UPLOADS_DIR = BASE_DIR / "uploads"
 DB_PATH = BASE_DIR / "vrungpu.db"
+
+# LLM Inference Server Config
+LLM_SERVER_SCRIPT = Path(__file__).parent / "inference_server.py"
+LLM_SERVER_PORT = 9826
+LLM_SERVER_URL = f"http://localhost:{LLM_SERVER_PORT}"
+DEFAULT_LLM_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_LLM_GPU = 0  # 단일 GPU 환경: LLM과 VrunGPU가 GPU 0을 번갈아 사용
+LLM_STARTUP_TIMEOUT = 120  # LLM 서버 시작 대기 시간 (초)
 
 # 디렉토리 생성
 for d in [BASE_DIR, WORKSPACES_DIR, MODELS_DIR, UPLOADS_DIR]:
@@ -219,6 +229,39 @@ class GPUPoolStatus(BaseModel):
 class ProgressUpdate(BaseModel):
     progress: float = Field(..., ge=0, le=100, description="진행률 (0-100)")
     message: str | None = Field(default=None, description="진행 상태 메시지")
+
+
+# LLM Service Models
+class LLMGenerateRequest(BaseModel):
+    prompt: str = Field(..., description="입력 프롬프트")
+    max_new_tokens: int = Field(default=512, description="생성할 최대 토큰 수")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0, description="샘플링 온도")
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0, description="Top-p 샘플링")
+    top_k: int = Field(default=50, ge=0, description="Top-k 샘플링")
+    do_sample: bool = Field(default=True, description="샘플링 사용 여부")
+    system_prompt: str | None = Field(default=None, description="시스템 프롬프트")
+
+
+class LLMChatMessage(BaseModel):
+    role: str = Field(..., description="메시지 역할 (system/user/assistant)")
+    content: str = Field(..., description="메시지 내용")
+
+
+class LLMChatRequest(BaseModel):
+    messages: list[LLMChatMessage] = Field(..., description="대화 메시지 목록")
+    max_new_tokens: int = Field(default=512, description="생성할 최대 토큰 수")
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: int = Field(default=50, ge=0)
+    do_sample: bool = Field(default=True)
+
+
+class LLMServiceStatus(BaseModel):
+    running: bool
+    model: str | None = None
+    port: int = LLM_SERVER_PORT
+    pid: int | None = None
+    message: str = "LLM API는 /llm/generate, /llm/chat 엔드포인트를 통해 호출하세요"
 
 
 # ============================================================================
@@ -428,6 +471,86 @@ def _row_to_model(row) -> ModelInfo:
 gpu_pool = GPUPool()
 websocket_clients: set[WebSocket] = set()
 running_tasks: dict[str, TaskResult] = {}  # 메모리 캐시 (실행 중인 작업만)
+
+# LLM Inference Server Process
+llm_process: subprocess.Popen | None = None
+llm_model_name: str | None = None
+llm_switching_lock = asyncio.Lock()  # LLM 서비스 전환 동기화
+
+
+async def ensure_llm_stopped():
+    """VrunGPU 작업 전 LLM 서비스 중지 (GPU 확보)"""
+    global llm_process, llm_model_name
+
+    async with llm_switching_lock:
+        # Check if LLM is running
+        if llm_process is not None and llm_process.poll() is None:
+            print("[Auto-Switch] LLM 서비스 중지 중...")
+            llm_process.terminate()
+            try:
+                llm_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                llm_process.kill()
+                llm_process.wait()
+            llm_process = None
+            # llm_model_name은 유지 (재시작 시 사용)
+            print("[Auto-Switch] LLM 서비스 중지 완료")
+            await asyncio.sleep(1)  # GPU 메모리 해제 대기
+            return True
+    return False
+
+
+async def ensure_llm_running(model: str | None = None):
+    """LLM API 호출 전 LLM 서비스 자동 시작"""
+    global llm_process, llm_model_name
+
+    async with llm_switching_lock:
+        # Check if already running
+        try:
+            async with httpx.AsyncClient(timeout=3.0) as client:
+                resp = await client.get(f"{LLM_SERVER_URL}/health")
+                if resp.status_code == 200:
+                    return True  # Already running
+        except Exception:
+            pass
+
+        # Start LLM service
+        target_model = model or llm_model_name or DEFAULT_LLM_MODEL
+        print(f"[Auto-Switch] LLM 서비스 시작 중... ({target_model})")
+
+        if not LLM_SERVER_SCRIPT.exists():
+            raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
+
+        llm_process = subprocess.Popen(
+            [sys.executable, str(LLM_SERVER_SCRIPT), "--model", target_model,
+             "--port", str(LLM_SERVER_PORT), "--gpu", str(DEFAULT_LLM_GPU)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(LLM_SERVER_SCRIPT.parent),
+        )
+        llm_model_name = target_model
+
+        # Wait for server to be ready
+        start_time = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start_time < LLM_STARTUP_TIMEOUT:
+            if llm_process.poll() is not None:
+                output = llm_process.stdout.read() if llm_process.stdout else ""
+                raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {output[:500]}")
+
+            try:
+                async with httpx.AsyncClient(timeout=2.0) as client:
+                    resp = await client.get(f"{LLM_SERVER_URL}/health")
+                    if resp.status_code == 200:
+                        print(f"[Auto-Switch] LLM 서비스 시작 완료 (PID: {llm_process.pid})")
+                        return True
+            except Exception:
+                pass
+
+            await asyncio.sleep(2)
+
+        raise HTTPException(status_code=504, detail="LLM 서버 시작 타임아웃 (모델 로딩 시간 초과)")
+
 
 # 데이터베이스 초기화
 init_database()
@@ -786,7 +909,10 @@ async def get_gpu_pool_status():
 
 @app.post("/run/sync", response_model=TaskResult)
 async def run_sync(request: CodeRequest):
-    """동기 실행 (결과를 기다림)"""
+    """동기 실행 (결과를 기다림, LLM 자동 중지)"""
+    # GPU 확보를 위해 LLM 서비스 자동 중지
+    await ensure_llm_stopped()
+
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
@@ -847,7 +973,10 @@ async def run_sync(request: CodeRequest):
 
 @app.post("/run/async", response_model=AsyncTaskResponse)
 async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
-    """비동기 실행 (즉시 반환, 백그라운드 실행)"""
+    """비동기 실행 (즉시 반환, 백그라운드 실행, LLM 자동 중지)"""
+    # GPU 확보를 위해 LLM 서비스 자동 중지
+    await ensure_llm_stopped()
+
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
@@ -890,7 +1019,10 @@ async def run_project(
     model_name: str | None = Form(default=None),
     background_tasks: BackgroundTasks = None,
 ):
-    """프로젝트 업로드 후 실행 (스트리밍 업로드 지원, 타임아웃 무제한)"""
+    """프로젝트 업로드 후 실행 (스트리밍 업로드, LLM 자동 중지)"""
+    # GPU 확보를 위해 LLM 서비스 자동 중지
+    await ensure_llm_stopped()
+
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
     work_dir.mkdir(parents=True)
@@ -1046,7 +1178,10 @@ async def run_inference(
     request: InferenceRequest,
     background_tasks: BackgroundTasks,
 ):
-    """모델로 추론 실행"""
+    """모델로 추론 실행 (LLM 자동 중지)"""
+    # GPU 확보를 위해 LLM 서비스 자동 중지
+    await ensure_llm_stopped()
+
     model = get_model(model_id)
     if not model:
         raise HTTPException(status_code=404, detail="모델을 찾을 수 없습니다.")
@@ -1264,6 +1399,139 @@ async def get_statistics():
             "current": gpu_pool.get_status(),
         }
     }
+
+
+# ============================================================================
+# API Endpoints - LLM Service
+# ============================================================================
+
+@app.post("/llm/start", response_model=LLMServiceStatus)
+async def start_llm_service(
+    model: str = Query(default=DEFAULT_LLM_MODEL, description="HuggingFace 모델 이름"),
+    gpu: int = Query(default=DEFAULT_LLM_GPU, description="사용할 GPU ID"),
+):
+    """LLM 추론 서버 시작 (Qwen3-8B 등)"""
+    global llm_process, llm_model_name
+
+    if llm_process is not None and llm_process.poll() is None:
+        raise HTTPException(status_code=400, detail="LLM 서비스가 이미 실행 중입니다.")
+
+    if not LLM_SERVER_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
+
+    # Start the inference server as a subprocess (GPU 1 for LLM by default)
+    llm_process = subprocess.Popen(
+        [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        cwd=str(LLM_SERVER_SCRIPT.parent),
+    )
+    llm_model_name = model
+
+    # Wait a moment and check if it started
+    await asyncio.sleep(2)
+    if llm_process.poll() is not None:
+        output = llm_process.stdout.read() if llm_process.stdout else ""
+        raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {output}")
+
+    return LLMServiceStatus(
+        running=True,
+        model=model,
+        port=LLM_SERVER_PORT,
+        pid=llm_process.pid,
+    )
+
+
+@app.post("/llm/stop")
+async def stop_llm_service():
+    """LLM 추론 서버 중지"""
+    global llm_process, llm_model_name
+
+    if llm_process is None or llm_process.poll() is not None:
+        return {"message": "LLM 서비스가 실행 중이 아닙니다.", "running": False}
+
+    # Gracefully terminate
+    llm_process.terminate()
+    try:
+        llm_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        llm_process.kill()
+        llm_process.wait()
+
+    llm_process = None
+    llm_model_name = None
+
+    return {"message": "LLM 서비스가 중지되었습니다.", "running": False}
+
+
+@app.get("/llm/status", response_model=LLMServiceStatus)
+async def get_llm_status():
+    """LLM 서비스 상태 확인"""
+    global llm_process, llm_model_name
+
+    running = False
+    detected_model = llm_model_name
+
+    # Try to ping the server (works even if started externally)
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{LLM_SERVER_URL}/")
+            if resp.status_code == 200:
+                running = True
+                data = resp.json()
+                detected_model = data.get("model", llm_model_name)
+    except Exception:
+        running = False
+
+    return LLMServiceStatus(
+        running=running,
+        model=detected_model if running else None,
+        port=LLM_SERVER_PORT,
+        pid=llm_process.pid if llm_process and llm_process.poll() is None else None,
+    )
+
+
+@app.post("/llm/generate")
+async def llm_generate(request: LLMGenerateRequest):
+    """LLM 텍스트 생성 (자동 서비스 시작)"""
+    # 자동으로 LLM 서비스 시작
+    await ensure_llm_running()
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{LLM_SERVER_URL}/generate",
+                json=request.model_dump(),
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="LLM 생성 타임아웃")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+
+
+@app.post("/llm/chat")
+async def llm_chat(request: LLMChatRequest):
+    """LLM 채팅 (자동 서비스 시작)"""
+    # 자동으로 LLM 서비스 시작
+    await ensure_llm_running()
+
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            resp = await client.post(
+                f"{LLM_SERVER_URL}/chat",
+                json=request.model_dump(),
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="LLM 생성 타임아웃")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
 
 
 # ============================================================================
