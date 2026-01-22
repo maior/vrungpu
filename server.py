@@ -557,8 +557,8 @@ init_database()
 
 app = FastAPI(
     title="VrunGPU",
-    description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리)",
-    version="0.4.0",
+    description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리 + LLM Chat)",
+    version="0.5.0",
 )
 
 app.add_middleware(
@@ -1540,7 +1540,7 @@ async def llm_chat(request: LLMChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"VrunGPU Server v0.4.0 starting with {gpu_pool.gpu_count} GPUs")
+    print(f"VrunGPU Server v0.5.0 starting with {gpu_pool.gpu_count} GPUs")
     print(f"Database: {DB_PATH}")
     print(f"Workspaces: {WORKSPACES_DIR}")
     print(f"Models: {MODELS_DIR}")

@@ -21,6 +21,8 @@ Remote GPU execution server for training and inference. Send Python code from yo
 - **Model Registry**: Register, query, and download trained models
 - **Inference API**: Run inference on registered models
 - **Progress Tracking**: Real-time training progress monitoring
+- **LLM Chat API**: Built-in LLM inference service (Qwen2.5/Qwen3 support)
+- **Auto GPU Switching**: LLM and training jobs share GPU automatically
 
 ## Who is this for?
 
@@ -316,6 +318,98 @@ Response:
 curl http://your-server:9825/task/{task_id}
 ```
 
+---
+
+## LLM Chat API
+
+Built-in LLM inference service with automatic GPU management. Supports Qwen2.5 and Qwen3 models.
+
+### Supported Models
+
+| Model | HuggingFace Name | VRAM (FP16) |
+|-------|------------------|-------------|
+| Qwen2.5-3B | `Qwen/Qwen2.5-3B-Instruct` | ~8GB |
+| Qwen2.5-7B | `Qwen/Qwen2.5-7B-Instruct` | ~16GB |
+| Qwen3-8B | `Qwen/Qwen3-8B` | ~18GB |
+
+### Start LLM Service
+
+```bash
+# Start with specific model
+curl -X POST "http://your-server:9825/llm/start?model=Qwen/Qwen2.5-7B-Instruct&gpu=0"
+```
+
+### Chat API
+
+```bash
+curl -X POST http://your-server:9825/llm/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [
+      {"role": "user", "content": "Hello, how are you?"}
+    ],
+    "max_new_tokens": 256,
+    "temperature": 0.7
+  }'
+```
+
+### Text Generation API
+
+```bash
+curl -X POST http://your-server:9825/llm/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "Write a Python quicksort function",
+    "max_new_tokens": 512,
+    "temperature": 0.7
+  }'
+```
+
+### LLM Service Management
+
+```bash
+# Check status
+curl http://your-server:9825/llm/status
+
+# Stop service (free GPU memory)
+curl -X POST http://your-server:9825/llm/stop
+```
+
+### Auto GPU Switching
+
+VrunGPU automatically manages GPU resources between LLM and training:
+
+- **Training job submitted** → LLM service automatically stops
+- **LLM API called** → LLM service automatically starts (if not running)
+
+This allows seamless sharing of a single GPU between training and LLM inference.
+
+### Python Example
+
+```python
+import requests
+
+SERVER = "http://your-server:9825"
+
+# Start LLM with specific model
+requests.post(f"{SERVER}/llm/start", params={
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "gpu": 0
+})
+
+# Chat
+response = requests.post(f"{SERVER}/llm/chat", json={
+    "messages": [{"role": "user", "content": "Explain machine learning"}],
+    "max_new_tokens": 512
+})
+print(response.json()["generated_text"])
+
+# Stop when done
+requests.post(f"{SERVER}/llm/stop")
+```
+
+---
+
 ### Custom Inference Logic
 
 For complex inference, use the `/run/async` endpoint:
@@ -449,6 +543,16 @@ print(f"Task started: {task_id}")
 | `/model/{model_id}/download` | GET | Download model file |
 | `/model/{model_id}/inference` | POST | Run inference with model |
 
+### LLM Service Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/llm/start` | POST | Start LLM service (params: model, gpu) |
+| `/llm/stop` | POST | Stop LLM service |
+| `/llm/status` | GET | Get LLM service status |
+| `/llm/generate` | POST | Text generation (auto-starts LLM) |
+| `/llm/chat` | POST | Chat completion (auto-starts LLM) |
+
 ---
 
 ## WebSocket Real-time Monitoring
@@ -560,6 +664,7 @@ vrungpu/
 ```
 vrungpu/
 ├── server.py           # FastAPI server (main)
+├── inference_server.py # LLM inference server (Qwen2.5/Qwen3)
 ├── client.py           # Python client
 ├── requirements.txt    # Dependencies
 ├── test_server.py      # Test script
@@ -683,6 +788,7 @@ Response:
 
 ## Version History
 
+- **v0.5.0** - LLM Chat API (Qwen2.5/Qwen3), auto GPU switching, bitsandbytes/peft support
 - **v0.4.0** - SQLite persistence, model management API, inference API, progress tracking
 - **v0.3.0** - D3.js dashboard with smooth animations
 - **v0.2.0** - ZIP project upload, multi-GPU support
