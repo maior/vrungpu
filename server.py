@@ -880,7 +880,7 @@ async def root():
     return {
         "service": "VrunGPU",
         "status": "running",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "gpu_count": pool_status["total_gpus"],
         "available_gpus": len(pool_status["available_gpus"]),
         "total_tasks": total_tasks,
