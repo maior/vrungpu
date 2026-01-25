@@ -331,7 +331,8 @@ Built-in LLM inference service with automatic GPU management. Supports Qwen2.5 a
 | Qwen2.5-3B | `Qwen/Qwen2.5-3B-Instruct` | ~8GB | ~3GB |
 | Qwen2.5-7B | `Qwen/Qwen2.5-7B-Instruct` | ~16GB | ~5GB |
 | Qwen3-8B | `Qwen/Qwen3-8B` | ~18GB | ~6GB |
-| DeepSeek-R1-7B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | ~16GB | ~5GB |
+| DeepSeek-R1-7B (Qwen) | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | ~16GB | ~5GB |
+| DeepSeek-R1-8B (Llama) | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | ~18GB | ~6GB |
 | DeepSeek-R1-14B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | ~28GB | ~8GB |
 
 ### Start LLM Service
