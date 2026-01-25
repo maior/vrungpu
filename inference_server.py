@@ -1,9 +1,10 @@
 """
 VrunGPU Inference Server - Persistent LLM Service
-Qwen3-8B 모델을 상시 로드하여 빠른 추론 제공
+Qwen3-8B, Qwen2.5, DeepSeek-R1 등 다양한 LLM 지원
 
 Usage:
     python inference_server.py [--port 9826] [--model Qwen/Qwen3-8B]
+    python inference_server.py --model deepseek-ai/DeepSeek-R1-Distill-Qwen-14B --load-in-4bit
 """
 
 import argparse
@@ -13,7 +14,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from datetime import datetime
 import uvicorn
 
@@ -69,14 +70,25 @@ model = None
 tokenizer = None
 model_name = None
 device = None
+quantization_mode = None  # None, "4bit", "8bit"
 
 
-def load_model(model_id: str):
-    """모델 로드"""
-    global model, tokenizer, model_name, device
+def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = False):
+    """모델 로드 (4-bit/8-bit 양자화 지원)"""
+    global model, tokenizer, model_name, device, quantization_mode
 
     print(f"Loading model: {model_id}")
     print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
+
+    if load_in_4bit:
+        print("Quantization: 4-bit (bitsandbytes)")
+        quantization_mode = "4bit"
+    elif load_in_8bit:
+        print("Quantization: 8-bit (bitsandbytes)")
+        quantization_mode = "8bit"
+    else:
+        print("Quantization: None (FP16)")
+        quantization_mode = None
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -90,12 +102,37 @@ def load_model(model_id: str):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-        device_map="auto" if device == "cuda" else None,
-        trust_remote_code=True
-    )
+    # 양자화 설정
+    if load_in_4bit and device == "cuda":
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    elif load_in_8bit and device == "cuda":
+        bnb_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+        )
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            quantization_config=bnb_config,
+            device_map="auto",
+            trust_remote_code=True
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+            device_map="auto" if device == "cuda" else None,
+            trust_remote_code=True
+        )
 
     if device == "cpu":
         model = model.to(device)
@@ -134,6 +171,7 @@ async def root():
         "status": "running",
         "model": model_name,
         "device": device,
+        "quantization": quantization_mode,
         "cuda_available": torch.cuda.is_available(),
         "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
     }
@@ -269,6 +307,8 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name or path")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto)")
+    parser.add_argument("--load-in-4bit", action="store_true", help="Load model in 4-bit quantization (saves VRAM)")
+    parser.add_argument("--load-in-8bit", action="store_true", help="Load model in 8-bit quantization")
     args = parser.parse_args()
 
     # GPU 설정
@@ -281,7 +321,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 모델 로드
-    load_model(args.model)
+    load_model(args.model, load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit)
 
     print(f"\nStarting server on {args.host}:{args.port}")
     print(f"API Docs: http://{args.host}:{args.port}/docs")

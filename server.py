@@ -1409,8 +1409,10 @@ async def get_statistics():
 async def start_llm_service(
     model: str = Query(default=DEFAULT_LLM_MODEL, description="HuggingFace 모델 이름"),
     gpu: int = Query(default=DEFAULT_LLM_GPU, description="사용할 GPU ID"),
+    load_in_4bit: bool = Query(default=False, description="4-bit 양자화 (VRAM 절약, 14B+ 모델 권장)"),
+    load_in_8bit: bool = Query(default=False, description="8-bit 양자화"),
 ):
-    """LLM 추론 서버 시작 (Qwen3-8B 등)"""
+    """LLM 추론 서버 시작 (Qwen3-8B, DeepSeek-R1 등)"""
     global llm_process, llm_model_name
 
     if llm_process is not None and llm_process.poll() is None:
@@ -1419,9 +1421,16 @@ async def start_llm_service(
     if not LLM_SERVER_SCRIPT.exists():
         raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
 
-    # Start the inference server as a subprocess (GPU 1 for LLM by default)
+    # Build command with optional quantization
+    cmd = [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)]
+    if load_in_4bit:
+        cmd.append("--load-in-4bit")
+    elif load_in_8bit:
+        cmd.append("--load-in-8bit")
+
+    # Start the inference server as a subprocess
     llm_process = subprocess.Popen(
-        [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)],
+        cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
