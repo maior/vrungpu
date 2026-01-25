@@ -893,6 +893,150 @@ async def root():
     }
 
 
+@app.get("/help")
+async def get_usage_help():
+    """VrunGPU 사용방법 문서 (원격 조회 가능)"""
+    return {
+        "service": "VrunGPU",
+        "version": "0.5.0",
+        "description": "원격 GPU 학습/추론 실행 서버 + LLM Chat API",
+
+        "llm_models": {
+            "description": "지원되는 LLM 모델 목록",
+            "models": [
+                {
+                    "name": "Qwen/Qwen3-8B",
+                    "size": "8B",
+                    "vram": "~16GB",
+                    "quantization": "불필요",
+                    "note": "기본 모델"
+                },
+                {
+                    "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+                    "size": "7B",
+                    "vram": "~14GB",
+                    "quantization": "불필요",
+                    "note": "DeepSeek-R1 Qwen 7B 버전"
+                },
+                {
+                    "name": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+                    "size": "8B",
+                    "vram": "~16GB",
+                    "quantization": "불필요",
+                    "note": "DeepSeek-R1 Llama 8B 버전"
+                },
+                {
+                    "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+                    "size": "14B",
+                    "vram": "~10GB (4-bit)",
+                    "quantization": "load_in_4bit=true 필수",
+                    "note": "DeepSeek-R1 14B - 4-bit 양자화 권장"
+                }
+            ]
+        },
+
+        "api_examples": {
+            "llm_chat": {
+                "description": "LLM 채팅 API (자동 서비스 시작)",
+                "endpoint": "POST /llm/chat",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/chat" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "messages": [
+      {"role": "user", "content": "안녕하세요!"}
+    ],
+    "max_new_tokens": 512,
+    "temperature": 0.7
+  }' ''',
+                "python_example": '''import requests
+
+response = requests.post(
+    "http://{SERVER_IP}:9825/llm/chat",
+    json={
+        "messages": [{"role": "user", "content": "안녕하세요!"}],
+        "max_new_tokens": 512,
+        "temperature": 0.7
+    }
+)
+print(response.json())'''
+            },
+
+            "llm_generate": {
+                "description": "LLM 텍스트 생성 API",
+                "endpoint": "POST /llm/generate",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/generate" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "prompt": "Python으로 피보나치 함수를 작성해줘",
+    "max_new_tokens": 512,
+    "temperature": 0.7
+  }' '''
+            },
+
+            "llm_start_with_quantization": {
+                "description": "4-bit 양자화로 대형 모델 시작 (14B+)",
+                "endpoint": "POST /llm/start",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B&load_in_4bit=true"'''
+            },
+
+            "run_training": {
+                "description": "GPU 학습 코드 실행 (비동기)",
+                "endpoint": "POST /run/async",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/run/async" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "code": "import torch\\nprint(torch.cuda.is_available())",
+    "name": "test_gpu"
+  }' '''
+            },
+
+            "check_task": {
+                "description": "작업 상태 확인",
+                "endpoint": "GET /task/{task_id}",
+                "curl_example": '''curl "http://{SERVER_IP}:9825/task/{TASK_ID}"'''
+            }
+        },
+
+        "endpoints_summary": {
+            "LLM API": [
+                "POST /llm/start - LLM 서비스 시작 (model, load_in_4bit, load_in_8bit 파라미터)",
+                "POST /llm/stop - LLM 서비스 중지",
+                "GET  /llm/status - LLM 서비스 상태 확인",
+                "POST /llm/chat - 채팅 API (자동 서비스 시작)",
+                "POST /llm/generate - 텍스트 생성 API (자동 서비스 시작)"
+            ],
+            "Training API": [
+                "POST /run/sync - 동기 실행 (결과 대기)",
+                "POST /run/async - 비동기 실행 (즉시 반환)",
+                "POST /run/project - 프로젝트 ZIP 업로드 후 실행",
+                "GET  /task/{task_id} - 작업 상태 조회",
+                "GET  /tasks - 작업 목록 조회"
+            ],
+            "Model API": [
+                "GET  /models - 모델 목록 조회",
+                "GET  /model/{model_id} - 모델 상세 정보",
+                "POST /model/register - 모델 등록",
+                "POST /model/{model_id}/inference - 모델 추론"
+            ],
+            "System API": [
+                "GET  / - 서버 상태",
+                "GET  /help - 사용방법 (이 문서)",
+                "GET  /gpu - GPU 상태",
+                "GET  /stats - 통계 정보",
+                "WS   /ws - WebSocket 실시간 모니터링"
+            ]
+        },
+
+        "notes": [
+            "LLM과 Training은 GPU를 공유합니다. Training 시작 시 LLM이 자동 중지됩니다.",
+            "/llm/chat, /llm/generate 호출 시 LLM 서비스가 자동으로 시작됩니다.",
+            "14B 이상 모델은 load_in_4bit=true 옵션을 사용하세요.",
+            "Dashboard: http://{SERVER_IP}:9824",
+            "API Docs (Swagger): http://{SERVER_IP}:9825/docs"
+        ]
+    }
+
+
 @app.get("/gpu", response_model=GPUInfo)
 async def get_gpu_status():
     return get_gpu_info()
