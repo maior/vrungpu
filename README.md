@@ -326,23 +326,27 @@ Built-in LLM inference service with automatic GPU management. Supports Qwen2.5 a
 
 ### Supported Models
 
-| Model | HuggingFace Name | VRAM (FP16) | VRAM (4-bit) |
-|-------|------------------|-------------|--------------|
-| Qwen2.5-3B | `Qwen/Qwen2.5-3B-Instruct` | ~8GB | ~3GB |
-| Qwen2.5-7B | `Qwen/Qwen2.5-7B-Instruct` | ~16GB | ~5GB |
-| Qwen3-8B | `Qwen/Qwen3-8B` | ~18GB | ~6GB |
-| DeepSeek-R1-7B (Qwen) | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | ~16GB | ~5GB |
-| DeepSeek-R1-8B (Llama) | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | ~18GB | ~6GB |
-| DeepSeek-R1-14B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | ~28GB | ~8GB |
+| Model | HuggingFace Name | VRAM (FP16) | Note |
+|-------|------------------|-------------|------|
+| Qwen2.5-3B | `Qwen/Qwen2.5-3B-Instruct` | ~8GB | |
+| Qwen2.5-7B | `Qwen/Qwen2.5-7B-Instruct` | ~16GB | |
+| Qwen3-8B | `Qwen/Qwen3-8B` | ~18GB | 기본 모델 |
+| DeepSeek-R1-7B (Qwen) | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | ~16GB | |
+| DeepSeek-R1-8B (Llama) | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | ~18GB | |
+| DeepSeek-R1-14B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | ~28GB | V100 32GB 권장 |
+| GPT-OSS-20B | `openai/gpt-oss-20b` | ~41GB | OpenAI, Apache 2.0 |
 
 ### Start LLM Service
 
 ```bash
-# Start with specific model (FP16)
+# Start with specific model
 curl -X POST "http://your-server:9825/llm/start?model=Qwen/Qwen2.5-7B-Instruct&gpu=0"
 
-# Start with 4-bit quantization (recommended for 14B+ models)
-curl -X POST "http://your-server:9825/llm/start?model=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B&gpu=0&load_in_4bit=true"
+# Start DeepSeek-R1-14B (V100 32GB 권장)
+curl -X POST "http://your-server:9825/llm/start?model=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B&gpu=0"
+
+# Start GPT-OSS-20B (V100 32GB+ 권장)
+curl -X POST "http://your-server:9825/llm/start?model=openai/gpt-oss-20b&gpu=0"
 ```
 
 ### Chat API
@@ -403,11 +407,10 @@ requests.post(f"{SERVER}/llm/start", params={
     "gpu": 0
 })
 
-# Or start DeepSeek-R1 with 4-bit quantization
+# Or start GPT-OSS-20B (V100 32GB+ recommended)
 requests.post(f"{SERVER}/llm/start", params={
-    "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
-    "gpu": 0,
-    "load_in_4bit": True  # Recommended for 14B+ models
+    "model": "openai/gpt-oss-20b",
+    "gpu": 0
 })
 
 # Chat

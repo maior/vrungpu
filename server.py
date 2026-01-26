@@ -928,9 +928,16 @@ async def get_usage_help():
                 {
                     "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
                     "size": "14B",
-                    "vram": "~10GB (4-bit)",
-                    "quantization": "load_in_4bit=true 필수",
-                    "note": "DeepSeek-R1 14B - 4-bit 양자화 권장"
+                    "vram": "~28GB",
+                    "quantization": "불필요",
+                    "note": "DeepSeek-R1 14B"
+                },
+                {
+                    "name": "openai/gpt-oss-20b",
+                    "size": "20B",
+                    "vram": "~41GB",
+                    "quantization": "불필요 (V100 32GB 권장)",
+                    "note": "OpenAI GPT-OSS 20B - Apache 2.0 라이선스"
                 }
             ]
         },
@@ -973,10 +980,10 @@ print(response.json())'''
   }' '''
             },
 
-            "llm_start_with_quantization": {
-                "description": "4-bit 양자화로 대형 모델 시작 (14B+)",
+            "llm_start_gpt_oss": {
+                "description": "GPT-OSS-20B 모델 시작",
                 "endpoint": "POST /llm/start",
-                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B&load_in_4bit=true"'''
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=openai/gpt-oss-20b"'''
             },
 
             "run_training": {
@@ -1030,7 +1037,7 @@ print(response.json())'''
         "notes": [
             "LLM과 Training은 GPU를 공유합니다. Training 시작 시 LLM이 자동 중지됩니다.",
             "/llm/chat, /llm/generate 호출 시 LLM 서비스가 자동으로 시작됩니다.",
-            "14B 이상 모델은 load_in_4bit=true 옵션을 사용하세요.",
+            "V100 32GB GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",
             "API Docs (Swagger): http://{SERVER_IP}:9825/docs"
         ]
