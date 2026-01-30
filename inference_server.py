@@ -73,6 +73,38 @@ device = None
 quantization_mode = None  # None, "4bit", "8bit"
 
 
+def check_mxfp4_support() -> bool:
+    """현재 GPU가 MXFP4를 지원하는지 확인 (compute capability >= 7.5)"""
+    if not torch.cuda.is_available():
+        return False
+    major, minor = torch.cuda.get_device_capability()
+    return (major > 7) or (major == 7 and minor >= 5)
+
+
+def is_mxfp4_model(model_id: str) -> bool:
+    """모델 config에서 MXFP4 양자화 여부 자동 감지"""
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+
+        # quantization_config 확인
+        if hasattr(config, 'quantization_config'):
+            quant_config = config.quantization_config
+            if isinstance(quant_config, dict):
+                quant_method = quant_config.get('quant_method', '').lower()
+                if 'mxfp' in quant_method or 'mx' in quant_method:
+                    print(f"[Auto-Detect] MXFP4 quantization detected in {model_id}")
+                    return True
+            elif hasattr(quant_config, 'quant_method'):
+                if 'mxfp' in str(quant_config.quant_method).lower():
+                    print(f"[Auto-Detect] MXFP4 quantization detected in {model_id}")
+                    return True
+        return False
+    except Exception as e:
+        print(f"[Auto-Detect] Could not check model config: {e}")
+        return False
+
+
 def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = False):
     """모델 로드 (4-bit/8-bit 양자화 지원)"""
     global model, tokenizer, model_name, device, quantization_mode
@@ -80,8 +112,22 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
     print(f"Loading model: {model_id}")
     print(f"Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
 
-    if load_in_4bit:
-        print("Quantization: 4-bit (bitsandbytes)")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # MXFP4 모델 감지
+    is_mxfp = is_mxfp4_model(model_id)
+    mxfp_fallback = False
+    if is_mxfp and device == "cuda" and not check_mxfp4_support():
+        major, minor = torch.cuda.get_device_capability()
+        print(f"[MXFP4] GPU compute capability {major}.{minor} < 7.5")
+        print(f"[MXFP4] Will dequantize to BF16 using CPU (V100 compatible mode)")
+        mxfp_fallback = True
+
+    if mxfp_fallback:
+        print("Quantization: MXFP4 → BF16 (CPU dequantize)")
+        quantization_mode = "mxfp4_fallback"
+    elif load_in_4bit:
+        print("Quantization: 4-bit (bitsandbytes NF4)")
         quantization_mode = "4bit"
     elif load_in_8bit:
         print("Quantization: 8-bit (bitsandbytes)")
@@ -89,8 +135,6 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
     else:
         print("Quantization: None (FP16)")
         quantization_mode = None
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
@@ -103,7 +147,84 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
         tokenizer.pad_token = tokenizer.eos_token
 
     # 양자화 설정
-    if load_in_4bit and device == "cuda":
+    if mxfp_fallback and device == "cuda":
+        # MXFP4 모델: V100 등 compute < 7.5 GPU에서 CPU dequantization 사용
+        import gc
+        import tempfile
+
+        print("[MXFP4] Loading model (CPU dequantize → GPU)...")
+        print("[MXFP4] Patching dequantizer for CPU execution...")
+
+        # Monkey-patch: MXFP4 dequantization을 CPU에서 실행
+        import transformers.integrations.mxfp4 as mxfp4_module
+        import math
+
+        FP4_VALUES = mxfp4_module.FP4_VALUES
+
+        def cpu_only_convert_moe_packed_tensors(
+            blocks,
+            scales,
+            *,
+            dtype: torch.dtype = torch.bfloat16,
+            rows_per_chunk: int = 32768 * 1024,
+        ) -> torch.Tensor:
+            """CPU에서만 MXFP4 dequantization 수행"""
+            original_device = blocks.device
+            blocks = blocks.cpu()
+            scales = scales.cpu()
+            scales = scales.to(torch.int32) - 127
+
+            assert blocks.shape[:-1] == scales.shape, f"{blocks.shape[:-1]=} != {scales.shape=}"
+
+            lut = torch.tensor(FP4_VALUES, dtype=dtype, device="cpu")
+            *prefix_shape, G, B = blocks.shape
+            rows_total = math.prod(prefix_shape) * G
+
+            blocks = blocks.reshape(rows_total, B)
+            scales = scales.reshape(rows_total, 1)
+            out = torch.empty(rows_total, B * 2, dtype=dtype, device="cpu")
+
+            for r0 in range(0, rows_total, rows_per_chunk):
+                r1 = min(r0 + rows_per_chunk, rows_total)
+                blk, exp = blocks[r0:r1], scales[r0:r1]
+                idx_lo = (blk & 0x0F).to(torch.long)
+                idx_hi = (blk >> 4).to(torch.long)
+                sub = out[r0:r1]
+                sub[:, 0::2] = lut[idx_lo]
+                sub[:, 1::2] = lut[idx_hi]
+                torch.ldexp(sub, exp, out=sub)
+                del idx_lo, idx_hi, blk, exp, sub
+
+            out = out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
+            del blocks, scales, lut
+            result = out.transpose(1, 2).contiguous()
+            return result.to(original_device) if original_device.type == "cuda" else result
+
+        mxfp4_module.convert_moe_packed_tensors = cpu_only_convert_moe_packed_tensors
+        print("[MXFP4] Dequantizer patched")
+
+        # 디스크 오프로딩 폴더
+        offload_folder = tempfile.mkdtemp(prefix="vrungpu_offload_")
+        print(f"[MXFP4] Offload folder: {offload_folder}")
+
+        # 메모리를 최소화하여 로드
+        model = AutoModelForCausalLM.from_pretrained(
+            model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            offload_folder=offload_folder,
+            offload_state_dict=True,
+            max_memory={0: "28GiB", "cpu": "15GiB"},
+        )
+        print(f"[MXFP4] Model loaded successfully")
+
+        # 메모리 정리
+        gc.collect()
+        torch.cuda.empty_cache()
+    elif load_in_4bit and device == "cuda":
+        # 일반 모델: bitsandbytes 4-bit 적용
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -114,7 +235,8 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
             model_id,
             quantization_config=bnb_config,
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
     elif load_in_8bit and device == "cuda":
         bnb_config = BitsAndBytesConfig(
@@ -124,14 +246,16 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
             model_id,
             quantization_config=bnb_config,
             device_map="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype=torch.float16 if device == "cuda" else torch.float32,
             device_map="auto" if device == "cuda" else None,
-            trust_remote_code=True
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
         )
 
     if device == "cpu":
@@ -141,7 +265,12 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
     model_name = model_id
 
     print(f"Model loaded successfully!")
-    print(f"Model dtype: {model.dtype}")
+    if hasattr(model, 'dtype'):
+        print(f"Model dtype: {model.dtype}")
+    if torch.cuda.is_available():
+        mem_allocated = torch.cuda.memory_allocated() / 1024**3
+        mem_reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"GPU Memory: {mem_allocated:.2f}GB allocated, {mem_reserved:.2f}GB reserved")
 
 
 # ============================================================================

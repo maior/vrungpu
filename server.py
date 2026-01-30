@@ -935,9 +935,9 @@ async def get_usage_help():
                 {
                     "name": "openai/gpt-oss-20b",
                     "size": "20B",
-                    "vram": "~41GB",
-                    "quantization": "불필요 (V100 32GB 권장)",
-                    "note": "OpenAI GPT-OSS 20B - Apache 2.0 라이선스"
+                    "vram": "~12GB (4-bit) / ~41GB (FP16)",
+                    "quantization": "MXFP4 원본, V100에서 자동으로 bitsandbytes 4-bit 변환",
+                    "note": "OpenAI GPT-OSS 20B - Apache 2.0. compute < 7.5 GPU는 NF4 자동 적용"
                 }
             ]
         },
@@ -981,9 +981,10 @@ print(response.json())'''
             },
 
             "llm_start_gpt_oss": {
-                "description": "GPT-OSS-20B 모델 시작",
+                "description": "GPT-OSS-20B 모델 시작 (MXFP4→NF4 자동 변환)",
                 "endpoint": "POST /llm/start",
-                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=openai/gpt-oss-20b"'''
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=openai/gpt-oss-20b"''',
+                "note": "V100 등 compute < 7.5 GPU에서는 자동으로 bitsandbytes 4-bit 양자화 적용"
             },
 
             "run_training": {
@@ -1037,6 +1038,7 @@ print(response.json())'''
         "notes": [
             "LLM과 Training은 GPU를 공유합니다. Training 시작 시 LLM이 자동 중지됩니다.",
             "/llm/chat, /llm/generate 호출 시 LLM 서비스가 자동으로 시작됩니다.",
+            "MXFP4 모델(GPT-OSS-20B 등)은 compute < 7.5 GPU에서 자동으로 bitsandbytes 4-bit 변환됩니다.",
             "V100 32GB GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",
             "API Docs (Swagger): http://{SERVER_IP}:9825/docs"
