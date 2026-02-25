@@ -957,9 +957,9 @@ async def get_usage_help():
                 {
                     "name": "openai/gpt-oss-20b",
                     "size": "20B",
-                    "vram": "~12GB (4-bit) / ~41GB (FP16)",
-                    "quantization": "MXFP4 원본, V100에서 자동으로 bitsandbytes 4-bit 변환",
-                    "note": "OpenAI GPT-OSS 20B - Apache 2.0. compute < 7.5 GPU는 NF4 자동 적용"
+                    "vram": "~32GB (BF16 dequantized)",
+                    "quantization": "MXFP4 원본 → CPU dequantize → BF16 (V100 호환)",
+                    "note": "OpenAI GPT-OSS 20B - Apache 2.0. compute < 7.5 GPU는 CPU에서 MXFP4→BF16 변환 후 GPU 로딩"
                 }
             ]
         },
@@ -1003,10 +1003,10 @@ print(response.json())'''
             },
 
             "llm_start_gpt_oss": {
-                "description": "GPT-OSS-20B 모델 시작 (MXFP4→NF4 자동 변환)",
+                "description": "GPT-OSS-20B 모델 시작 (MXFP4 → CPU dequantize → BF16)",
                 "endpoint": "POST /llm/start",
-                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=openai/gpt-oss-20b"''',
-                "note": "V100 등 compute < 7.5 GPU에서는 자동으로 bitsandbytes 4-bit 양자화 적용"
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=openai/gpt-oss-20b&gpu=1"''',
+                "note": "V100 등 compute < 7.5 GPU에서 CPU dequantization 자동 적용. gpu 파라미터로 GPU 지정 가능"
             },
 
             "run_training": {
@@ -1029,9 +1029,9 @@ print(response.json())'''
 
         "endpoints_summary": {
             "LLM API": [
-                "POST /llm/start - LLM 서비스 시작 (model, load_in_4bit, load_in_8bit 파라미터)",
-                "POST /llm/stop - LLM 서비스 중지",
-                "GET  /llm/status - LLM 서비스 상태 확인",
+                "POST /llm/start - LLM 서비스 시작 (model, gpu, load_in_4bit, load_in_8bit 파라미터)",
+                "POST /llm/stop - LLM 서비스 중지 (GPU 자동 반환)",
+                "GET  /llm/status - LLM 서비스 상태 확인 (비정상 종료 시 GPU 자동 회수)",
                 "POST /llm/chat - 채팅 API (자동 서비스 시작)",
                 "POST /llm/generate - 텍스트 생성 API (자동 서비스 시작)"
             ],
@@ -1051,17 +1051,20 @@ print(response.json())'''
             "System API": [
                 "GET  / - 서버 상태",
                 "GET  /help - 사용방법 (이 문서)",
-                "GET  /gpu - GPU 상태",
+                "GET  /gpu - GPU 상태 (개별 디바이스 정보)",
+                "GET  /gpu/pool - GPU 풀 상태 (예약 현황)",
                 "GET  /stats - 통계 정보",
                 "WS   /ws - WebSocket 실시간 모니터링"
             ]
         },
 
         "notes": [
-            "LLM과 Training은 GPU를 공유합니다. Training 시작 시 LLM이 자동 중지됩니다.",
+            "GPU 2개 환경: LLM과 Training이 각각 다른 GPU에서 동시 실행 가능",
+            "LLM 시작 시 gpu_pool에서 GPU를 예약하며, 중지/비정상 종료 시 자동 반환됩니다.",
+            "gpu_pool이 꽉 찬 상태에서 LLM 시작 요청 시 409 에러가 반환됩니다.",
             "/llm/chat, /llm/generate 호출 시 LLM 서비스가 자동으로 시작됩니다.",
-            "MXFP4 모델(GPT-OSS-20B 등)은 compute < 7.5 GPU에서 자동으로 bitsandbytes 4-bit 변환됩니다.",
-            "V100 32GB GPU 환경 기준입니다.",
+            "MXFP4 모델(GPT-OSS-20B 등)은 compute < 7.5 GPU에서 CPU dequantize → BF16 변환됩니다.",
+            "V100S 32GB x2 GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",
             "API Docs (Swagger): http://{SERVER_IP}:9825/docs"
         ]
