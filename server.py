@@ -50,7 +50,7 @@ LLM_SERVER_SCRIPT = Path(__file__).parent / "inference_server.py"
 LLM_SERVER_PORT = 9826
 LLM_SERVER_URL = f"http://localhost:{LLM_SERVER_PORT}"
 DEFAULT_LLM_MODEL = "Qwen/Qwen3-8B"
-DEFAULT_LLM_GPU = 0  # 단일 GPU 환경: LLM과 VrunGPU가 GPU 0을 번갈아 사용
+DEFAULT_LLM_GPU = 0  # LLM 기본 GPU (gpu_pool과 연동하여 충돌 방지)
 LLM_STARTUP_TIMEOUT = 120  # LLM 서버 시작 대기 시간 (초)
 
 # 디렉토리 생성
@@ -475,12 +475,14 @@ running_tasks: dict[str, TaskResult] = {}  # 메모리 캐시 (실행 중인 작
 # LLM Inference Server Process
 llm_process: subprocess.Popen | None = None
 llm_model_name: str | None = None
+llm_gpu_id: int | None = None  # LLM이 점유 중인 GPU ID (gpu_pool과 연동)
 llm_switching_lock = asyncio.Lock()  # LLM 서비스 전환 동기화
+LLM_TASK_ID = "__llm_inference__"  # gpu_pool에서 LLM 예약용 task_id
 
 
 async def ensure_llm_stopped():
     """VrunGPU 작업 전 LLM 서비스 중지 (GPU 확보)"""
-    global llm_process, llm_model_name
+    global llm_process, llm_model_name, llm_gpu_id
 
     async with llm_switching_lock:
         # Check if LLM is running
@@ -493,6 +495,11 @@ async def ensure_llm_stopped():
                 llm_process.kill()
                 llm_process.wait()
             llm_process = None
+            # GPU 풀에서 해제
+            if llm_gpu_id is not None:
+                gpu_pool.release(llm_gpu_id)
+                print(f"[Auto-Switch] GPU {llm_gpu_id} 풀에 반환")
+                llm_gpu_id = None
             # llm_model_name은 유지 (재시작 시 사용)
             print("[Auto-Switch] LLM 서비스 중지 완료")
             await asyncio.sleep(1)  # GPU 메모리 해제 대기
@@ -502,7 +509,7 @@ async def ensure_llm_stopped():
 
 async def ensure_llm_running(model: str | None = None):
     """LLM API 호출 전 LLM 서비스 자동 시작"""
-    global llm_process, llm_model_name
+    global llm_process, llm_model_name, llm_gpu_id
 
     async with llm_switching_lock:
         # Check if already running
@@ -521,34 +528,49 @@ async def ensure_llm_running(model: str | None = None):
         if not LLM_SERVER_SCRIPT.exists():
             raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
 
+        # GPU 풀에서 예약
+        gpu = gpu_pool.acquire(LLM_TASK_ID, DEFAULT_LLM_GPU)
+        if gpu is None:
+            raise HTTPException(status_code=409, detail=f"GPU {DEFAULT_LLM_GPU}이(가) 사용 중입니다. LLM 서비스를 시작할 수 없습니다.")
+
         llm_process = subprocess.Popen(
             [sys.executable, str(LLM_SERVER_SCRIPT), "--model", target_model,
-             "--port", str(LLM_SERVER_PORT), "--gpu", str(DEFAULT_LLM_GPU)],
+             "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(LLM_SERVER_SCRIPT.parent),
         )
         llm_model_name = target_model
+        llm_gpu_id = gpu
+        print(f"[Auto-Switch] GPU {gpu} 예약 완료")
 
         # Wait for server to be ready
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < LLM_STARTUP_TIMEOUT:
             if llm_process.poll() is not None:
                 output = llm_process.stdout.read() if llm_process.stdout else ""
+                # 시작 실패 시 GPU 반환
+                gpu_pool.release(llm_gpu_id)
+                print(f"[Auto-Switch] 시작 실패, GPU {llm_gpu_id} 반환")
+                llm_gpu_id = None
                 raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {output[:500]}")
 
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
                     resp = await client.get(f"{LLM_SERVER_URL}/health")
                     if resp.status_code == 200:
-                        print(f"[Auto-Switch] LLM 서비스 시작 완료 (PID: {llm_process.pid})")
+                        print(f"[Auto-Switch] LLM 서비스 시작 완료 (PID: {llm_process.pid}, GPU: {gpu})")
                         return True
             except Exception:
                 pass
 
             await asyncio.sleep(2)
 
+        # 타임아웃 시 GPU 반환
+        gpu_pool.release(llm_gpu_id)
+        print(f"[Auto-Switch] 타임아웃, GPU {llm_gpu_id} 반환")
+        llm_gpu_id = None
         raise HTTPException(status_code=504, detail="LLM 서버 시작 타임아웃 (모델 로딩 시간 초과)")
 
 
@@ -1566,7 +1588,7 @@ async def start_llm_service(
     load_in_8bit: bool = Query(default=False, description="8-bit 양자화"),
 ):
     """LLM 추론 서버 시작 (Qwen3-8B, DeepSeek-R1 등)"""
-    global llm_process, llm_model_name
+    global llm_process, llm_model_name, llm_gpu_id
 
     if llm_process is not None and llm_process.poll() is None:
         raise HTTPException(status_code=400, detail="LLM 서비스가 이미 실행 중입니다.")
@@ -1574,8 +1596,13 @@ async def start_llm_service(
     if not LLM_SERVER_SCRIPT.exists():
         raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
 
+    # GPU 풀에서 예약
+    assigned_gpu = gpu_pool.acquire(LLM_TASK_ID, gpu)
+    if assigned_gpu is None:
+        raise HTTPException(status_code=409, detail=f"GPU {gpu}이(가) 사용 중입니다. LLM 서비스를 시작할 수 없습니다.")
+
     # Build command with optional quantization
-    cmd = [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)]
+    cmd = [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(LLM_SERVER_PORT), "--gpu", str(assigned_gpu)]
     if load_in_4bit:
         cmd.append("--load-in-4bit")
     elif load_in_8bit:
@@ -1590,11 +1617,17 @@ async def start_llm_service(
         cwd=str(LLM_SERVER_SCRIPT.parent),
     )
     llm_model_name = model
+    llm_gpu_id = assigned_gpu
+    print(f"[LLM] GPU {assigned_gpu} 예약, 모델: {model}")
 
     # Wait a moment and check if it started
     await asyncio.sleep(2)
     if llm_process.poll() is not None:
         output = llm_process.stdout.read() if llm_process.stdout else ""
+        # 시작 실패 시 GPU 반환
+        gpu_pool.release(llm_gpu_id)
+        print(f"[LLM] 시작 실패, GPU {llm_gpu_id} 반환")
+        llm_gpu_id = None
         raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {output}")
 
     return LLMServiceStatus(
@@ -1608,9 +1641,15 @@ async def start_llm_service(
 @app.post("/llm/stop")
 async def stop_llm_service():
     """LLM 추론 서버 중지"""
-    global llm_process, llm_model_name
+    global llm_process, llm_model_name, llm_gpu_id
 
     if llm_process is None or llm_process.poll() is not None:
+        # 프로세스가 이미 죽었는데 GPU가 아직 점유 중이면 회수
+        if llm_gpu_id is not None:
+            gpu_pool.release(llm_gpu_id)
+            print(f"[LLM] 이미 종료된 프로세스의 GPU {llm_gpu_id} 회수")
+            llm_gpu_id = None
+        llm_process = None
         return {"message": "LLM 서비스가 실행 중이 아닙니다.", "running": False}
 
     # Gracefully terminate
@@ -1624,16 +1663,30 @@ async def stop_llm_service():
     llm_process = None
     llm_model_name = None
 
+    # GPU 풀에서 해제
+    if llm_gpu_id is not None:
+        gpu_pool.release(llm_gpu_id)
+        print(f"[LLM] GPU {llm_gpu_id} 반환")
+        llm_gpu_id = None
+
     return {"message": "LLM 서비스가 중지되었습니다.", "running": False}
 
 
 @app.get("/llm/status", response_model=LLMServiceStatus)
 async def get_llm_status():
     """LLM 서비스 상태 확인"""
-    global llm_process, llm_model_name
+    global llm_process, llm_model_name, llm_gpu_id
 
     running = False
     detected_model = llm_model_name
+
+    # 비정상 종료 감지: 프로세스가 죽었는데 GPU가 아직 점유 중이면 회수
+    if llm_process is not None and llm_process.poll() is not None:
+        if llm_gpu_id is not None:
+            gpu_pool.release(llm_gpu_id)
+            print(f"[LLM] 비정상 종료 감지, GPU {llm_gpu_id} 자동 회수")
+            llm_gpu_id = None
+        llm_process = None
 
     # Try to ping the server (works even if started externally)
     try:
