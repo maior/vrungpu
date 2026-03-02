@@ -9,13 +9,15 @@ Usage:
 
 import argparse
 import os
+import uuid
+import threading
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-from datetime import datetime
+from datetime import datetime, timedelta
 import uvicorn
 
 # ============================================================================
@@ -45,12 +47,15 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(..., description="대화 메시지 목록")
+    messages: list[ChatMessage] = Field(default=None, description="대화 메시지 목록 (session_id 미사용 시 필수)")
+    message: str | None = Field(default=None, description="단일 메시지 (session_id 사용 시)")
+    session_id: str | None = Field(default=None, description="세션 ID (멀티턴 대화용)")
     max_new_tokens: int = Field(default=512, description="생성할 최대 토큰 수")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     top_k: int = Field(default=50, ge=0)
     do_sample: bool = Field(default=False)
+    system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
 
 
 class GenerateResponse(BaseModel):
@@ -60,6 +65,98 @@ class GenerateResponse(BaseModel):
     total_tokens: int
     model: str
     elapsed_time: float
+    session_id: str | None = None
+
+
+class SessionInfo(BaseModel):
+    session_id: str
+    created_at: str
+    updated_at: str
+    message_count: int
+    total_tokens: int
+    system_prompt: str | None = None
+
+
+# ============================================================================
+# Session Store
+# ============================================================================
+
+SESSION_TTL_HOURS = 4  # 세션 만료 시간
+
+class SessionStore:
+    """서버 사이드 대화 세션 관리"""
+
+    def __init__(self):
+        self._sessions: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    def create(self, session_id: str | None = None, system_prompt: str | None = None) -> str:
+        sid = session_id or str(uuid.uuid4())[:8]
+        now = datetime.now()
+        with self._lock:
+            self._sessions[sid] = {
+                "messages": [],
+                "system_prompt": system_prompt,
+                "created_at": now,
+                "updated_at": now,
+                "total_tokens": 0,
+            }
+        return sid
+
+    def get(self, session_id: str) -> dict | None:
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def add_message(self, session_id: str, role: str, content: str, tokens: int = 0):
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return
+            session["messages"].append({"role": role, "content": content})
+            session["updated_at"] = datetime.now()
+            session["total_tokens"] += tokens
+
+    def get_messages(self, session_id: str) -> list[dict]:
+        """세션의 전체 메시지를 반환 (system_prompt 포함)"""
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return []
+            msgs = []
+            if session["system_prompt"]:
+                msgs.append({"role": "system", "content": session["system_prompt"]})
+            msgs.extend(session["messages"])
+            return msgs
+
+    def delete(self, session_id: str) -> bool:
+        with self._lock:
+            return self._sessions.pop(session_id, None) is not None
+
+    def list_sessions(self) -> list[dict]:
+        with self._lock:
+            result = []
+            for sid, s in self._sessions.items():
+                result.append({
+                    "session_id": sid,
+                    "created_at": s["created_at"].isoformat(),
+                    "updated_at": s["updated_at"].isoformat(),
+                    "message_count": len(s["messages"]),
+                    "total_tokens": s["total_tokens"],
+                    "system_prompt": s["system_prompt"],
+                })
+            return result
+
+    def cleanup_expired(self):
+        """TTL 초과 세션 정리"""
+        cutoff = datetime.now() - timedelta(hours=SESSION_TTL_HOURS)
+        with self._lock:
+            expired = [sid for sid, s in self._sessions.items() if s["updated_at"] < cutoff]
+            for sid in expired:
+                del self._sessions[sid]
+            if expired:
+                print(f"[Session] {len(expired)}개 만료 세션 정리: {expired}")
+
+session_store = SessionStore()
 
 
 # ============================================================================
@@ -375,14 +472,37 @@ async def generate(request: GenerateRequest):
 
 @app.post("/chat", response_model=GenerateResponse)
 async def chat(request: ChatRequest):
-    """채팅 형식 추론"""
+    """채팅 형식 추론 (세션 지원)
+
+    사용법:
+    1. Stateless (기존): messages 배열 직접 전달
+    2. 세션 시작: message + session_id (없으면 자동 생성)
+    3. 세션 이어가기: message + session_id (기존 세션)
+    """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    start_time = datetime.now()
+    # 만료 세션 정리
+    session_store.cleanup_expired()
 
-    # 메시지를 dict 형식으로 변환
-    messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    start_time = datetime.now()
+    sid = request.session_id
+
+    # 세션 모드: message (단일 메시지) + session_id
+    if request.message is not None:
+        # 세션이 없으면 새로 생성
+        if sid is None or session_store.get(sid) is None:
+            sid = session_store.create(sid, request.system_prompt)
+            print(f"[Session] 새 세션 생성: {sid}")
+        # 사용자 메시지 추가
+        session_store.add_message(sid, "user", request.message)
+        messages = session_store.get_messages(sid)
+
+    # Stateless 모드: messages 배열 직접 전달
+    elif request.messages is not None:
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+    else:
+        raise HTTPException(status_code=400, detail="message 또는 messages 중 하나는 필수입니다.")
 
     # apply_chat_template 사용
     full_prompt = tokenizer.apply_chat_template(
@@ -414,6 +534,10 @@ async def chat(request: ChatRequest):
     generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     generated_tokens = len(generated_ids)
 
+    # 세션에 assistant 응답 저장
+    if sid and session_store.get(sid) is not None:
+        session_store.add_message(sid, "assistant", generated_text, prompt_tokens + generated_tokens)
+
     elapsed_time = (datetime.now() - start_time).total_seconds()
 
     return GenerateResponse(
@@ -422,8 +546,45 @@ async def chat(request: ChatRequest):
         generated_tokens=generated_tokens,
         total_tokens=prompt_tokens + generated_tokens,
         model=model_name,
-        elapsed_time=elapsed_time
+        elapsed_time=elapsed_time,
+        session_id=sid,
     )
+
+
+# ============================================================================
+# Session Management Endpoints
+# ============================================================================
+
+@app.get("/sessions")
+async def list_sessions():
+    """활성 세션 목록 조회"""
+    session_store.cleanup_expired()
+    return {"sessions": session_store.list_sessions()}
+
+
+@app.get("/session/{session_id}")
+async def get_session(session_id: str):
+    """세션 상세 조회 (대화 이력 포함)"""
+    session = session_store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail=f"세션 '{session_id}'을(를) 찾을 수 없습니다.")
+    return {
+        "session_id": session_id,
+        "system_prompt": session["system_prompt"],
+        "messages": session["messages"],
+        "created_at": session["created_at"].isoformat(),
+        "updated_at": session["updated_at"].isoformat(),
+        "message_count": len(session["messages"]),
+        "total_tokens": session["total_tokens"],
+    }
+
+
+@app.delete("/session/{session_id}")
+async def delete_session(session_id: str):
+    """세션 삭제"""
+    if session_store.delete(session_id):
+        return {"message": f"세션 '{session_id}' 삭제 완료"}
+    raise HTTPException(status_code=404, detail=f"세션 '{session_id}'을(를) 찾을 수 없습니다.")
 
 
 # ============================================================================

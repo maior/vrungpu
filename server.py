@@ -248,12 +248,15 @@ class LLMChatMessage(BaseModel):
 
 
 class LLMChatRequest(BaseModel):
-    messages: list[LLMChatMessage] = Field(..., description="대화 메시지 목록")
+    messages: list[LLMChatMessage] | None = Field(default=None, description="대화 메시지 목록 (stateless 모드)")
+    message: str | None = Field(default=None, description="단일 메시지 (세션 모드)")
+    session_id: str | None = Field(default=None, description="세션 ID (멀티턴 대화용)")
     max_new_tokens: int = Field(default=512, description="생성할 최대 토큰 수")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     top_k: int = Field(default=50, ge=0)
     do_sample: bool = Field(default=True)
+    system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
 
 
 class LLMServiceStatus(BaseModel):
@@ -1748,6 +1751,52 @@ async def llm_chat(request: LLMChatRequest):
             return resp.json()
     except httpx.TimeoutException:
         raise HTTPException(status_code=504, detail="LLM 생성 타임아웃")
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+
+
+# ============================================================================
+# API Endpoints - LLM Session Management
+# ============================================================================
+
+@app.get("/llm/sessions")
+async def llm_list_sessions():
+    """LLM 활성 세션 목록 조회"""
+    await ensure_llm_running()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{LLM_SERVER_URL}/sessions")
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+
+
+@app.get("/llm/session/{session_id}")
+async def llm_get_session(session_id: str):
+    """LLM 세션 상세 조회 (대화 이력 포함)"""
+    await ensure_llm_running()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(f"{LLM_SERVER_URL}/session/{session_id}")
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+    except httpx.ConnectError:
+        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+
+
+@app.delete("/llm/session/{session_id}")
+async def llm_delete_session(session_id: str):
+    """LLM 세션 삭제"""
+    await ensure_llm_running()
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.delete(f"{LLM_SERVER_URL}/session/{session_id}")
+            if resp.status_code != 200:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
 
