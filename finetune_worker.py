@@ -12,6 +12,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import signal
 import sys
@@ -180,11 +181,12 @@ def train(args):
         pin_memory=True,
     )
 
-    # Optimizer & Scheduler
+    # Optimizer & Scheduler & AMP Scaler (fp16 overflow 방지)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0.01)
     total_steps = len(dataloader) * args.epochs
     warmup_steps = min(100, total_steps // 10)
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    scaler = torch.amp.GradScaler("cuda")
 
     print(f"[FINETUNE:total_steps={total_steps},total_epochs={args.epochs},dataset_size={len(dataset)}]", flush=True)
 
@@ -233,22 +235,24 @@ def train(args):
             attention_mask = batch["attention_mask"].to("cuda")
             labels = batch["labels"].to("cuda")
 
-            # Forward + backward
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss = outputs.loss
-            loss.backward()
+            # Forward + backward (AMP for fp16 stability)
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                loss = outputs.loss
 
-            # Gradient clipping
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
 
             global_step += 1
             epoch_steps += 1
             step_loss = loss.item()
-            epoch_loss += step_loss
+            if not math.isnan(step_loss) and not math.isinf(step_loss):
+                epoch_loss += step_loss
 
             # Log entry
             log_entries.append({
@@ -289,7 +293,7 @@ def train(args):
     elapsed = time.time() - start_time
     config["completed_at"] = datetime.now().isoformat()
     config["elapsed_seconds"] = round(elapsed, 1)
-    config["final_loss"] = round(best_loss, 4)
+    config["final_loss"] = round(best_loss, 4) if math.isfinite(best_loss) else None
     config["status"] = "completed"
     _save_log(output_dir, log_entries, config, "completed")
 
