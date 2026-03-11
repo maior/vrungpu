@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import zipfile
 from contextlib import contextmanager
@@ -52,6 +53,10 @@ LLM_SERVER_URL = f"http://localhost:{LLM_SERVER_PORT}"
 DEFAULT_LLM_MODEL = "Qwen/Qwen3-8B"
 DEFAULT_LLM_GPU = 0  # LLM 기본 GPU (gpu_pool과 연동하여 충돌 방지)
 LLM_STARTUP_TIMEOUT = 120  # LLM 서버 시작 대기 시간 (초)
+
+# Fine-Tuning Config
+FINETUNE_SCRIPT = Path(__file__).parent / "finetune_worker.py"
+FINETUNE_DIR = MODELS_DIR / "finetune"
 
 # 디렉토리 생성
 for d in [BASE_DIR, WORKSPACES_DIR, MODELS_DIR, UPLOADS_DIR]:
@@ -257,6 +262,7 @@ class LLMChatRequest(BaseModel):
     top_k: int = Field(default=50, ge=0)
     do_sample: bool = Field(default=True)
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
+    ei_gate: bool = Field(default=False, description="E-I gate computation")
 
 
 class LLMServiceStatus(BaseModel):
@@ -265,6 +271,37 @@ class LLMServiceStatus(BaseModel):
     port: int = LLM_SERVER_PORT
     pid: int | None = None
     message: str = "LLM API는 /llm/generate, /llm/chat 엔드포인트를 통해 호출하세요"
+
+
+class FinetuneRequest(BaseModel):
+    model: str = Field(..., description="Base 모델 경로 또는 HuggingFace ID")
+    dataset_path: str = Field(..., description="서버 내 JSONL 데이터셋 경로")
+    epochs: int = Field(default=3, ge=1, le=50)
+    lora_r: int = Field(default=16, ge=4, le=128)
+    lora_alpha: int = Field(default=32, ge=1, le=256)
+    learning_rate: float = Field(default=2e-4, gt=0, le=1.0)
+    batch_size: int = Field(default=4, ge=1, le=32)
+    max_seq_length: int = Field(default=512, ge=64, le=4096)
+    gpu: int | None = Field(default=None, description="GPU ID (None=auto)")
+    name: str | None = Field(default=None, description="작업 이름")
+
+
+class FinetuneStatus(BaseModel):
+    task_id: str
+    status: str  # pending/running/completed/failed/cancelled
+    model: str
+    name: str | None = None
+    epoch: int = 0
+    total_epochs: int = 0
+    step: int = 0
+    total_steps: int = 0
+    loss: float | None = None
+    progress: float = 0
+    gpu_id: int | None = None
+    output_dir: str | None = None
+    started_at: str | None = None
+    elapsed_seconds: float | None = None
+    error: str | None = None
 
 
 # ============================================================================
@@ -480,6 +517,12 @@ llm_process: subprocess.Popen | None = None
 llm_model_name: str | None = None
 llm_gpu_id: int | None = None  # LLM이 점유 중인 GPU ID (gpu_pool과 연동)
 llm_switching_lock = asyncio.Lock()  # LLM 서비스 전환 동기화
+
+# Fine-Tuning State
+finetune_jobs: dict[str, dict] = {}
+# task_id -> { process, status, model, gpu_id, epoch, total_epochs,
+#              step, total_steps, loss, progress, output_dir, config, started_at }
+FINETUNE_TASK_PREFIX = "__finetune_"
 LLM_TASK_ID = "__llm_inference__"  # gpu_pool에서 LLM 예약용 task_id
 
 
@@ -1012,6 +1055,28 @@ print(response.json())'''
                 "note": "V100 등 compute < 7.5 GPU에서 CPU dequantization 자동 적용. gpu 파라미터로 GPU 지정 가능"
             },
 
+            "finetune": {
+                "description": "LoRA 파인튜닝 시작",
+                "endpoint": "POST /llm/finetune",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/finetune" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B",
+    "dataset_path": "/path/to/train.jsonl",
+    "epochs": 3,
+    "lora_r": 16,
+    "gpu": 1
+  }' ''',
+                "note": "PEFT fp16 LoRA. V100 32GB에서 Qwen3.5-9B 학습 가능. 진행 상황: GET /llm/finetune/status?task_id={ID}"
+            },
+
+            "finetune_model_start": {
+                "description": "파인튜닝된 모델로 LLM 시작",
+                "endpoint": "POST /llm/start",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B&lora_adapter={TASK_ID}&gpu=1"''',
+                "note": "lora_adapter에 파인튜닝 task_id 또는 전체 경로 지정"
+            },
+
             "run_training": {
                 "description": "GPU 학습 코드 실행 (비동기)",
                 "endpoint": "POST /run/async",
@@ -1032,11 +1097,20 @@ print(response.json())'''
 
         "endpoints_summary": {
             "LLM API": [
-                "POST /llm/start - LLM 서비스 시작 (model, gpu, load_in_4bit, load_in_8bit 파라미터)",
+                "POST /llm/start - LLM 서비스 시작 (model, gpu, lora_adapter, load_in_4bit 파라미터)",
                 "POST /llm/stop - LLM 서비스 중지 (GPU 자동 반환)",
                 "GET  /llm/status - LLM 서비스 상태 확인 (비정상 종료 시 GPU 자동 회수)",
-                "POST /llm/chat - 채팅 API (자동 서비스 시작)",
-                "POST /llm/generate - 텍스트 생성 API (자동 서비스 시작)"
+                "POST /llm/chat - 채팅 API (자동 서비스 시작, session_id로 멀티턴 지원)",
+                "POST /llm/generate - 텍스트 생성 API (자동 서비스 시작)",
+                "GET  /llm/sessions - 활성 세션 목록",
+                "GET  /llm/session/{id} - 세션 대화 이력 조회",
+                "DELETE /llm/session/{id} - 세션 삭제"
+            ],
+            "Fine-Tuning API": [
+                "POST /llm/finetune - LoRA 파인튜닝 시작 (model, dataset_path, epochs, lora_r 등)",
+                "GET  /llm/finetune/status?task_id={id} - 파인튜닝 진행 상황 (loss, epoch, step)",
+                "POST /llm/finetune/stop?task_id={id} - 파인튜닝 중단 (체크포인트 저장)",
+                "GET  /llm/finetune/models - 파인튜닝된 모델 목록"
             ],
             "Training API": [
                 "POST /run/sync - 동기 실행 (결과 대기)",
@@ -1062,11 +1136,12 @@ print(response.json())'''
         },
 
         "notes": [
-            "GPU 2개 환경: LLM과 Training이 각각 다른 GPU에서 동시 실행 가능",
-            "LLM 시작 시 gpu_pool에서 GPU를 예약하며, 중지/비정상 종료 시 자동 반환됩니다.",
-            "gpu_pool이 꽉 찬 상태에서 LLM 시작 요청 시 409 에러가 반환됩니다.",
-            "/llm/chat, /llm/generate 호출 시 LLM 서비스가 자동으로 시작됩니다.",
-            "MXFP4 모델(GPT-OSS-20B 등)은 compute < 7.5 GPU에서 CPU dequantize → BF16 변환됩니다.",
+            "GPU 2개 환경: LLM과 Training/Fine-tuning이 각각 다른 GPU에서 동시 실행 가능",
+            "LLM/파인튜닝 시작 시 gpu_pool에서 GPU를 예약하며, 종료 시 자동 반환됩니다.",
+            "파인튜닝: PEFT fp16 LoRA 방식 (QLoRA 4-bit 미사용). V100 호환.",
+            "파인튜닝 데이터셋 JSONL 포맷: messages, instruction/output, text 자동 감지",
+            "파인튜닝 완료 후 lora_adapter 파라미터로 /llm/start에서 바로 사용 가능",
+            "/llm/chat에 session_id로 멀티턴 대화 세션 지원 (TTL 4시간)",
             "V100S 32GB x2 GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",
             "API Docs (Swagger): http://{SERVER_IP}:9825/docs"
@@ -1592,8 +1667,10 @@ async def start_llm_service(
     gpu: int = Query(default=DEFAULT_LLM_GPU, description="사용할 GPU ID"),
     load_in_4bit: bool = Query(default=False, description="4-bit 양자화 (VRAM 절약, 14B+ 모델 권장)"),
     load_in_8bit: bool = Query(default=False, description="8-bit 양자화"),
+    lora_adapter: str | None = Query(default=None, description="LoRA 어댑터 경로 (파인튜닝된 모델)"),
+    ei_checkpoint: str = Query(default=None, description="E-I gate checkpoint directory"),
 ):
-    """LLM 추론 서버 시작 (Qwen3-8B, DeepSeek-R1 등)"""
+    """LLM 추론 서버 시작 (Qwen3-8B, DeepSeek-R1 등, 파인튜닝 모델 지원)"""
     global llm_process, llm_model_name, llm_gpu_id
 
     if llm_process is not None and llm_process.poll() is None:
@@ -1601,6 +1678,15 @@ async def start_llm_service(
 
     if not LLM_SERVER_SCRIPT.exists():
         raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
+
+    # LoRA 어댑터 경로 해석 (shorthand 지원: finetune/{task_id})
+    if lora_adapter:
+        adapter_path = Path(lora_adapter)
+        if not adapter_path.is_absolute():
+            adapter_path = FINETUNE_DIR / lora_adapter
+        if not (adapter_path / "adapter_config.json").exists():
+            raise HTTPException(status_code=400, detail=f"LoRA 어댑터를 찾을 수 없습니다: {adapter_path}")
+        lora_adapter = str(adapter_path)
 
     # GPU 풀에서 예약
     assigned_gpu = gpu_pool.acquire(LLM_TASK_ID, gpu)
@@ -1613,7 +1699,12 @@ async def start_llm_service(
         cmd.append("--load-in-4bit")
     elif load_in_8bit:
         cmd.append("--load-in-8bit")
+    if lora_adapter:
+        cmd.extend(["--lora-adapter", lora_adapter])
 
+
+    if ei_checkpoint:
+        cmd.extend(["--ei-checkpoint", ei_checkpoint])
     # Start the inference server as a subprocess
     llm_process = subprocess.Popen(
         cmd,
@@ -1799,6 +1890,239 @@ async def llm_delete_session(session_id: str):
             return resp.json()
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+
+
+# ============================================================================
+# API Endpoints - Fine-Tuning
+# ============================================================================
+
+async def monitor_finetune(task_id: str, process, assigned_gpu: int):
+    """파인튜닝 프로세스 stdout 모니터링 및 상태 업데이트"""
+    import re
+    job = finetune_jobs[task_id]
+
+    try:
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                continue
+
+            # Parse [PROGRESS:xx.x:message]
+            m = re.match(r"\[PROGRESS:([\d.]+):(.*)\]", text)
+            if m:
+                job["progress"] = float(m.group(1))
+
+            # Parse [FINETUNE:key=val,...]
+            m = re.match(r"\[FINETUNE:(.*)\]", text)
+            if m:
+                pairs = dict(p.split("=", 1) for p in m.group(1).split(",") if "=" in p)
+                if "epoch" in pairs:
+                    job["epoch"] = int(pairs["epoch"])
+                if "step" in pairs:
+                    job["step"] = int(pairs["step"])
+                if "loss" in pairs:
+                    job["loss"] = float(pairs["loss"])
+                if "total_steps" in pairs:
+                    job["total_steps"] = int(pairs["total_steps"])
+                if "total_epochs" in pairs:
+                    job["total_epochs"] = int(pairs["total_epochs"])
+                if "status" in pairs:
+                    if pairs["status"] in ("completed", "failed", "cancelled"):
+                        job["status"] = pairs["status"]
+
+    except Exception as e:
+        print(f"[Finetune Monitor] Error: {e}")
+
+    # Wait for process to finish
+    await process.wait()
+    exit_code = process.returncode
+
+    # Update final status
+    if job["status"] not in ("completed", "cancelled"):
+        job["status"] = "completed" if exit_code == 0 else "failed"
+    job["progress"] = 100.0 if job["status"] == "completed" else job["progress"]
+
+    elapsed = time.time() - job["_start_time"]
+    job["elapsed_seconds"] = round(elapsed, 1)
+
+    # Release GPU
+    gpu_pool.release(assigned_gpu)
+    print(f"[Finetune] {task_id} {job['status']}, GPU {assigned_gpu} 반환 ({elapsed:.0f}s)")
+
+
+@app.post("/llm/finetune")
+async def start_finetune(request: FinetuneRequest, background_tasks: BackgroundTasks):
+    """LoRA 파인튜닝 시작 (비동기, GPU 풀 예약)"""
+
+    # Validate
+    if not FINETUNE_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail="finetune_worker.py를 찾을 수 없습니다.")
+    if not Path(request.dataset_path).exists():
+        raise HTTPException(status_code=400, detail=f"데이터셋을 찾을 수 없습니다: {request.dataset_path}")
+
+    # Generate task ID and output dir
+    task_id = str(uuid.uuid4())[:8]
+    output_dir = FINETUNE_DIR / task_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Acquire GPU
+    ft_task_id = f"{FINETUNE_TASK_PREFIX}{task_id}__"
+    assigned_gpu = gpu_pool.acquire(ft_task_id, request.gpu)
+    if assigned_gpu is None:
+        if request.gpu is not None:
+            raise HTTPException(status_code=409, detail=f"GPU {request.gpu}이(가) 사용 중입니다.")
+        raise HTTPException(status_code=409, detail="사용 가능한 GPU가 없습니다.")
+
+    # Build command
+    cmd = [
+        sys.executable, str(FINETUNE_SCRIPT),
+        "--model", request.model,
+        "--dataset", request.dataset_path,
+        "--output-dir", str(output_dir),
+        "--epochs", str(request.epochs),
+        "--lora-r", str(request.lora_r),
+        "--lora-alpha", str(request.lora_alpha),
+        "--learning-rate", str(request.learning_rate),
+        "--batch-size", str(request.batch_size),
+        "--max-seq-length", str(request.max_seq_length),
+    ]
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+
+    # Start subprocess
+    process = await asyncio.subprocess.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+        cwd=str(FINETUNE_SCRIPT.parent),
+    )
+
+    # Store job state
+    finetune_jobs[task_id] = {
+        "task_id": task_id,
+        "process": process,
+        "status": "running",
+        "model": request.model,
+        "name": request.name,
+        "gpu_id": assigned_gpu,
+        "epoch": 0,
+        "total_epochs": request.epochs,
+        "step": 0,
+        "total_steps": 0,
+        "loss": None,
+        "progress": 0,
+        "output_dir": str(output_dir),
+        "config": request.model_dump(),
+        "started_at": datetime.now().isoformat(),
+        "_start_time": time.time(),
+        "elapsed_seconds": None,
+    }
+
+    # Monitor in background
+    background_tasks.add_task(monitor_finetune, task_id, process, assigned_gpu)
+
+    print(f"[Finetune] {task_id} started: {request.model} on GPU {assigned_gpu}")
+    return {
+        "task_id": task_id,
+        "status": "running",
+        "model": request.model,
+        "gpu_id": assigned_gpu,
+        "output_dir": str(output_dir),
+        "message": f"파인튜닝 시작됨. GET /llm/finetune/status?task_id={task_id} 로 진행 상황 확인",
+    }
+
+
+@app.get("/llm/finetune/status", response_model=FinetuneStatus)
+async def get_finetune_status(task_id: str = Query(..., description="파인튜닝 작업 ID")):
+    """파인튜닝 진행 상황 조회"""
+    job = finetune_jobs.get(task_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"파인튜닝 작업 '{task_id}'을(를) 찾을 수 없습니다.")
+
+    return FinetuneStatus(
+        task_id=job["task_id"],
+        status=job["status"],
+        model=job["model"],
+        name=job.get("name"),
+        epoch=job["epoch"],
+        total_epochs=job["total_epochs"],
+        step=job["step"],
+        total_steps=job["total_steps"],
+        loss=job["loss"],
+        progress=job["progress"],
+        gpu_id=job["gpu_id"],
+        output_dir=job["output_dir"],
+        started_at=job["started_at"],
+        elapsed_seconds=job.get("elapsed_seconds"),
+    )
+
+
+@app.post("/llm/finetune/stop")
+async def stop_finetune(task_id: str = Query(..., description="중단할 파인튜닝 작업 ID")):
+    """파인튜닝 중단 (체크포인트 저장 후 종료)"""
+    job = finetune_jobs.get(task_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"파인튜닝 작업 '{task_id}'을(를) 찾을 수 없습니다.")
+    if job["status"] != "running":
+        return {"message": f"작업이 이미 {job['status']} 상태입니다.", "status": job["status"]}
+
+    # Send SIGTERM for graceful shutdown
+    process = job["process"]
+    if process.returncode is None:
+        process.terminate()
+        job["status"] = "cancelling"
+
+    return {"message": f"파인튜닝 중단 요청됨 (체크포인트 저장 중)", "task_id": task_id}
+
+
+@app.get("/llm/finetune/models")
+async def list_finetune_models():
+    """파인튜닝된 모델 목록 조회"""
+    FINETUNE_DIR.mkdir(parents=True, exist_ok=True)
+    models = []
+
+    for d in sorted(FINETUNE_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        adapter_config = d / "adapter_config.json"
+        training_args = d / "training_args.json"
+
+        if not adapter_config.exists():
+            # 아직 학습 중이거나 실패한 작업
+            if training_args.exists():
+                with open(training_args) as f:
+                    args = json.load(f)
+                models.append({
+                    "task_id": d.name,
+                    "status": args.get("status", "unknown"),
+                    "model": args.get("model"),
+                    "path": str(d),
+                    "ready": False,
+                })
+            continue
+
+        # 완료된 모델
+        info = {"task_id": d.name, "path": str(d), "ready": True}
+        if training_args.exists():
+            with open(training_args) as f:
+                args = json.load(f)
+            info.update({
+                "model": args.get("model"),
+                "status": args.get("status", "completed"),
+                "final_loss": args.get("final_loss"),
+                "epochs": args.get("epochs"),
+                "lora_r": args.get("lora_r"),
+                "dataset_size": args.get("dataset_size"),
+                "elapsed_seconds": args.get("elapsed_seconds"),
+            })
+        models.append(info)
+
+    return {"models": models, "finetune_dir": str(FINETUNE_DIR)}
 
 
 # ============================================================================

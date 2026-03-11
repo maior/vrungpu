@@ -20,6 +20,21 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from datetime import datetime, timedelta
 import uvicorn
 
+# Fix: Newer transformers calls model_info() in _patch_mistral_regex, which fails without internet.
+# Wrap the classmethod to catch network errors and skip (we only use Qwen, not Mistral).
+try:
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase as _PTTB
+    _orig_pmr = _PTTB._patch_mistral_regex.__func__
+    @classmethod
+    def _safe_patch_mistral_regex(cls, tokenizer, *args, **kwargs):
+        try:
+            return _orig_pmr(cls, tokenizer, *args, **kwargs)
+        except Exception:
+            return tokenizer
+    _PTTB._patch_mistral_regex = _safe_patch_mistral_regex
+except Exception:
+    pass
+
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -47,7 +62,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: list[ChatMessage] = Field(default=None, description="대화 메시지 목록 (session_id 미사용 시 필수)")
+    messages: list[ChatMessage] | None = Field(default=None, description="대화 메시지 목록 (session_id 미사용 시 필수)")
     message: str | None = Field(default=None, description="단일 메시지 (session_id 사용 시)")
     session_id: str | None = Field(default=None, description="세션 ID (멀티턴 대화용)")
     max_new_tokens: int = Field(default=512, description="생성할 최대 토큰 수")
@@ -56,6 +71,7 @@ class ChatRequest(BaseModel):
     top_k: int = Field(default=50, ge=0)
     do_sample: bool = Field(default=False)
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
+    ei_gate: bool = Field(default=False, description="E-I gate computation")
 
 
 class GenerateResponse(BaseModel):
@@ -66,6 +82,7 @@ class GenerateResponse(BaseModel):
     model: str
     elapsed_time: float
     session_id: str | None = None
+    ei_info: dict | None = None
 
 
 class SessionInfo(BaseModel):
@@ -169,6 +186,146 @@ model_name = None
 device = None
 quantization_mode = None  # None, "4bit", "8bit"
 
+# E-I Gate state (loaded to CPU)
+ei_gate_weights = None
+
+
+def load_ei_gates(checkpoint_dir: str):
+    global ei_gate_weights
+    import torch, json as _json
+    from safetensors import safe_open
+
+    cfg_path = os.path.join(checkpoint_dir, "ei_config.json")
+    if not os.path.exists(cfg_path):
+        print(f"[E-I] Config not found: {cfg_path}")
+        return False
+
+    with open(cfg_path) as f:
+        cfg = _json.load(f)
+
+    ei_layers = cfg.get("ei_enabled_layers", [])
+    risk_gate_hidden = cfg.get("risk_gate_hidden", 256)
+
+    st_path = os.path.join(checkpoint_dir, "ei_gates_only.safetensors")
+    if not os.path.exists(st_path):
+        st_path = os.path.join(checkpoint_dir, "ei_weights.safetensors")
+    if not os.path.exists(st_path):
+        print(f"[E-I] Weights not found in {checkpoint_dir}")
+        return False
+
+    gate_weights = {}
+    alpha_key_map = {}
+    with safe_open(st_path, framework="pt", device="cpu") as sf:
+        all_keys = list(sf.keys())
+        for li in ei_layers:
+            w = {}
+            prefix = f"{li}."
+            for k in all_keys:
+                if k.startswith(prefix):
+                    w[k[len(prefix):]] = sf.get_tensor(k)
+            if w:
+                gate_weights[li] = w
+        for k in all_keys:
+            if "alpha" in k:
+                parts = k.split(".")
+                try:
+                    li = int(parts[0])
+                    alpha_key_map[li] = sf.get_tensor(k)
+                except (ValueError, IndexError):
+                    pass
+
+    ei_gate_weights = {
+        "weights": gate_weights,
+        "layers": ei_layers,
+        "risk_gate_hidden": risk_gate_hidden,
+        "alpha_values": alpha_key_map,
+    }
+    total_params = sum(sum(t.numel() for t in w.values()) for w in gate_weights.values())
+    print(f"[E-I] Gates loaded to CPU: {len(gate_weights)} layers, {total_params:,} params, hidden={risk_gate_hidden}")
+    return True
+
+
+def compute_ei_gates(input_text: str):
+    import torch
+    import torch.nn.functional as F
+
+    if ei_gate_weights is None or model is None:
+        return None
+
+    ei_layers = ei_gate_weights["layers"]
+    weights = ei_gate_weights["weights"]
+    rgh = ei_gate_weights["risk_gate_hidden"]
+
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
+    display_tokens = [tokenizer.decode([t]) for t in inputs["input_ids"][0]]
+
+    captured = {}
+    hooks = []
+    for li in ei_layers:
+        def make_hook(layer_idx):
+            def fn(module, inp, out):
+                h = inp[0] if isinstance(inp, tuple) else inp
+                captured[layer_idx] = h.mean(dim=1).detach().cpu()
+                return out
+            return fn
+        try:
+            layer = model.model.layers[li].mlp
+            hooks.append(layer.register_forward_hook(make_hook(li)))
+        except (AttributeError, IndexError) as e:
+            print(f"[E-I] Hook error layer {li}: {e}")
+
+    dev = next(model.parameters()).device
+    with torch.no_grad():
+        model(input_ids=inputs["input_ids"].to(dev), attention_mask=inputs["attention_mask"].to(dev))
+
+    for h in hooks:
+        h.remove()
+
+    gate_list, alpha_list = [], []
+    risk_ctx = None
+    for li in ei_layers:
+        if li not in weights or li not in captured:
+            continue
+        h = captured[li]
+        w = weights[li]
+        has_ln = "risk_gate.gate_mlp.1.weight" in w
+        has_ctx = "risk_gate.context_proj.weight" in w
+        out_idx = 4 if has_ln else 3
+        with torch.no_grad():
+            if has_ctx:
+                new_ctx = F.linear(h.to(w["risk_gate.context_proj.weight"].dtype), w["risk_gate.context_proj.weight"], w.get("risk_gate.context_proj.bias"))
+                gi = torch.cat([h, risk_ctx if risk_ctx is not None else torch.zeros(1, rgh, dtype=h.dtype)], dim=-1)
+            else:
+                gi = h
+            # Cast to match gate weight dtype
+            target_dtype = w["risk_gate.gate_mlp.0.weight"].dtype
+            gi = gi.to(target_dtype)
+            x = F.linear(gi, w["risk_gate.gate_mlp.0.weight"], w["risk_gate.gate_mlp.0.bias"])
+            if has_ln:
+                x = F.layer_norm(x, [rgh], w["risk_gate.gate_mlp.1.weight"], w["risk_gate.gate_mlp.1.bias"])
+            x = F.gelu(x)
+            x = F.linear(x, w[f"risk_gate.gate_mlp.{out_idx}.weight"], w[f"risk_gate.gate_mlp.{out_idx}.bias"])
+            g = torch.sigmoid(x)
+            gate_list.append(round(g[0, 0].item(), 4))
+            av = ei_gate_weights.get("alpha_values", {})
+            alpha_list.append(round(av[li].item(), 4) if li in av else 0.1)
+            if has_ctx:
+                risk_ctx = new_ctx
+
+    captured.clear()
+    mean_gate = sum(gate_list) / max(len(gate_list), 1)
+    return {
+        "mean_gate": round(mean_gate, 4),
+        "max_gate": max(gate_list) if gate_list else 0,
+        "min_gate": min(gate_list) if gate_list else 0,
+        "gate_per_layer": gate_list,
+        "alpha_values": alpha_list,
+        "ei_layers": ei_layers,
+        "tokens": display_tokens,
+        "token_gates": [[g for g in gate_list] for _ in display_tokens],
+    }
+
+
 
 def check_mxfp4_support() -> bool:
     """현재 GPU가 MXFP4를 지원하는지 확인 (compute capability >= 7.5)"""
@@ -202,7 +359,7 @@ def is_mxfp4_model(model_id: str) -> bool:
         return False
 
 
-def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = False):
+def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = False, lora_adapter: str | None = None):
     """모델 로드 (4-bit/8-bit 양자화 지원)"""
     global model, tokenizer, model_name, device, quantization_mode
 
@@ -357,6 +514,14 @@ def load_model(model_id: str, load_in_4bit: bool = False, load_in_8bit: bool = F
 
     if device == "cpu":
         model = model.to(device)
+
+    # LoRA 어댑터 로딩
+    if lora_adapter:
+        from peft import PeftModel
+        print(f"Loading LoRA adapter: {lora_adapter}")
+        model = PeftModel.from_pretrained(model, lora_adapter)
+        model = model.merge_and_unload()  # 추론 속도를 위해 merge
+        print(f"LoRA adapter merged successfully")
 
     model.eval()
     model_name = model_id
@@ -538,6 +703,21 @@ async def chat(request: ChatRequest):
     if sid and session_store.get(sid) is not None:
         session_store.add_message(sid, "assistant", generated_text, prompt_tokens + generated_tokens)
 
+
+    # E-I gate computation
+    ei_info = None
+    if request.ei_gate and ei_gate_weights is not None:
+        try:
+            last_user_msg = None
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    last_user_msg = msg["content"]
+                    break
+            if last_user_msg:
+                ei_info = compute_ei_gates(last_user_msg)
+        except Exception as e:
+            print(f"[E-I] Gate computation error: {e}")
+            ei_info = {"error": str(e)}
     elapsed_time = (datetime.now() - start_time).total_seconds()
 
     return GenerateResponse(
@@ -548,6 +728,7 @@ async def chat(request: ChatRequest):
         model=model_name,
         elapsed_time=elapsed_time,
         session_id=sid,
+        ei_info=ei_info,
     )
 
 
@@ -599,6 +780,8 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", type=int, default=None, help="GPU ID to use (default: auto)")
     parser.add_argument("--load-in-4bit", action="store_true", help="Load model in 4-bit quantization (saves VRAM)")
     parser.add_argument("--load-in-8bit", action="store_true", help="Load model in 8-bit quantization")
+    parser.add_argument("--lora-adapter", type=str, default=None, help="LoRA adapter path (fine-tuned model)")
+    parser.add_argument("--ei-checkpoint", type=str, default=None, help="E-I gate checkpoint dir")
     args = parser.parse_args()
 
     # GPU 설정
@@ -611,7 +794,15 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # 모델 로드
-    load_model(args.model, load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit)
+    load_model(args.model, load_in_4bit=args.load_in_4bit, load_in_8bit=args.load_in_8bit, lora_adapter=args.lora_adapter)
+
+    # E-I gate loading (CPU)
+    if args.ei_checkpoint:
+        ok = load_ei_gates(args.ei_checkpoint)
+        if ok:
+            print(f"[E-I] Gates loaded from: {args.ei_checkpoint}")
+        else:
+            print(f"[E-I] WARNING: Failed to load from: {args.ei_checkpoint}")
 
     print(f"\nStarting server on {args.host}:{args.port}")
     print(f"API Docs: http://{args.host}:{args.port}/docs")
