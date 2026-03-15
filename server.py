@@ -50,9 +50,26 @@ DB_PATH = BASE_DIR / "vrungpu.db"
 LLM_SERVER_SCRIPT = Path(__file__).parent / "inference_server.py"
 LLM_SERVER_PORT = 9826
 LLM_SERVER_URL = f"http://localhost:{LLM_SERVER_PORT}"
-DEFAULT_LLM_MODEL = "Qwen/Qwen3-8B"
+DEFAULT_LLM_MODEL = "Qwen/Qwen3.5-9B"
 DEFAULT_LLM_GPU = 0  # LLM 기본 GPU (gpu_pool과 연동하여 충돌 방지)
 LLM_STARTUP_TIMEOUT = 120  # LLM 서버 시작 대기 시간 (초)
+
+# 모델 alias → 실제 경로 매핑 (짧은 이름으로 호출 가능)
+MODEL_ALIASES = {
+    "Qwen/Qwen3.5-9B": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B",
+    "qwen3.5-9b": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B",
+    "Qwen/Qwen3-8B": "Qwen/Qwen3-8B",
+    "qwen3-8b": "Qwen/Qwen3-8B",
+    "deepseek-7b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+    "deepseek-8b": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+    "deepseek-14b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+    "gpt-oss-20b": "openai/gpt-oss-20b",
+}
+
+
+def resolve_model_name(model: str) -> str:
+    """모델 alias를 실제 경로/이름으로 변환"""
+    return MODEL_ALIASES.get(model, model)
 
 # Fine-Tuning Config
 FINETUNE_SCRIPT = Path(__file__).parent / "finetune_worker.py"
@@ -568,7 +585,7 @@ async def ensure_llm_running(model: str | None = None):
             pass
 
         # Start LLM service
-        target_model = model or llm_model_name or DEFAULT_LLM_MODEL
+        target_model = resolve_model_name(model or llm_model_name or DEFAULT_LLM_MODEL)
         print(f"[Auto-Switch] LLM 서비스 시작 중... ({target_model})")
 
         if not LLM_SERVER_SCRIPT.exists():
@@ -579,10 +596,14 @@ async def ensure_llm_running(model: str | None = None):
         if gpu is None:
             raise HTTPException(status_code=409, detail=f"GPU {DEFAULT_LLM_GPU}이(가) 사용 중입니다. LLM 서비스를 시작할 수 없습니다.")
 
+        # stdout을 로그 파일로 리다이렉트 (PIPE 버퍼 데드락 방지)
+        auto_log_path = Path("data/logs")
+        auto_log_path.mkdir(parents=True, exist_ok=True)
+        auto_log_file = open(auto_log_path / "inference_server.log", "w")
         llm_process = subprocess.Popen(
             [sys.executable, str(LLM_SERVER_SCRIPT), "--model", target_model,
              "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)],
-            stdout=subprocess.PIPE,
+            stdout=auto_log_file,
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(LLM_SERVER_SCRIPT.parent),
@@ -595,12 +616,12 @@ async def ensure_llm_running(model: str | None = None):
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < LLM_STARTUP_TIMEOUT:
             if llm_process.poll() is not None:
-                output = llm_process.stdout.read() if llm_process.stdout else ""
+                log_output = (auto_log_path / "inference_server.log").read_text()[-500:]
                 # 시작 실패 시 GPU 반환
                 gpu_pool.release(llm_gpu_id)
                 print(f"[Auto-Switch] 시작 실패, GPU {llm_gpu_id} 반환")
                 llm_gpu_id = None
-                raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {output[:500]}")
+                raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {log_output}")
 
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
@@ -973,11 +994,20 @@ async def get_usage_help():
             "description": "지원되는 LLM 모델 목록",
             "models": [
                 {
+                    "name": "Qwen/Qwen3.5-9B",
+                    "alias": "qwen3.5-9b",
+                    "size": "9B",
+                    "vram": "~18GB",
+                    "quantization": "불필요",
+                    "note": "기본 모델 (로컬 설치됨, 파인튜닝 지원)"
+                },
+                {
                     "name": "Qwen/Qwen3-8B",
+                    "alias": "qwen3-8b",
                     "size": "8B",
                     "vram": "~16GB",
                     "quantization": "불필요",
-                    "note": "기본 모델"
+                    "note": "Qwen3 8B"
                 },
                 {
                     "name": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
@@ -1073,8 +1103,8 @@ print(response.json())'''
             "finetune_model_start": {
                 "description": "파인튜닝된 모델로 LLM 시작",
                 "endpoint": "POST /llm/start",
-                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B&lora_adapter={TASK_ID}&gpu=1"''',
-                "note": "lora_adapter에 파인튜닝 task_id 또는 전체 경로 지정"
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=qwen3.5-9b&lora_adapter={TASK_ID}&gpu=1"''',
+                "note": "lora_adapter에 파인튜닝 task_id 또는 전체 경로 지정. model에 alias 사용 가능"
             },
 
             "run_training": {
@@ -1135,7 +1165,15 @@ print(response.json())'''
             ]
         },
 
+        "model_aliases": {
+            "description": "짧은 이름(alias)으로 모델 지정 가능",
+            "aliases": MODEL_ALIASES,
+            "example": 'curl -X POST "http://{SERVER_IP}:9825/llm/start?model=qwen3.5-9b"'
+        },
+
         "notes": [
+            "기본 모델: Qwen3.5-9B (model 파라미터 없이 /llm/chat 호출 시 자동 시작)",
+            "모델 alias 지원: qwen3.5-9b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b 등",
             "GPU 2개 환경: LLM과 Training/Fine-tuning이 각각 다른 GPU에서 동시 실행 가능",
             "LLM/파인튜닝 시작 시 gpu_pool에서 GPU를 예약하며, 종료 시 자동 반환됩니다.",
             "파인튜닝: PEFT fp16 LoRA 방식 (QLoRA 4-bit 미사용). V100 호환.",
@@ -1670,8 +1708,11 @@ async def start_llm_service(
     lora_adapter: str | None = Query(default=None, description="LoRA 어댑터 경로 (파인튜닝된 모델)"),
     ei_checkpoint: str = Query(default=None, description="E-I gate checkpoint directory"),
 ):
-    """LLM 추론 서버 시작 (Qwen3-8B, DeepSeek-R1 등, 파인튜닝 모델 지원)"""
+    """LLM 추론 서버 시작 (Qwen3.5-9B, DeepSeek-R1 등, 파인튜닝 모델 지원)"""
     global llm_process, llm_model_name, llm_gpu_id
+
+    # 모델 alias 해석
+    model = resolve_model_name(model)
 
     if llm_process is not None and llm_process.poll() is None:
         raise HTTPException(status_code=400, detail="LLM 서비스가 이미 실행 중입니다.")
@@ -1706,9 +1747,13 @@ async def start_llm_service(
     if ei_checkpoint:
         cmd.extend(["--ei-checkpoint", ei_checkpoint])
     # Start the inference server as a subprocess
+    # stdout을 로그 파일로 리다이렉트 (PIPE 버퍼 데드락 방지)
+    llm_log_path = Path("data/logs")
+    llm_log_path.mkdir(parents=True, exist_ok=True)
+    llm_log_file = open(llm_log_path / "inference_server.log", "w")
     llm_process = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=llm_log_file,
         stderr=subprocess.STDOUT,
         text=True,
         cwd=str(LLM_SERVER_SCRIPT.parent),
@@ -1720,12 +1765,12 @@ async def start_llm_service(
     # Wait a moment and check if it started
     await asyncio.sleep(2)
     if llm_process.poll() is not None:
-        output = llm_process.stdout.read() if llm_process.stdout else ""
+        log_output = (llm_log_path / "inference_server.log").read_text()[-500:]
         # 시작 실패 시 GPU 반환
         gpu_pool.release(llm_gpu_id)
         print(f"[LLM] 시작 실패, GPU {llm_gpu_id} 반환")
         llm_gpu_id = None
-        raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {output}")
+        raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {log_output}")
 
     return LLMServiceStatus(
         running=True,
@@ -1977,9 +2022,12 @@ async def start_finetune(request: FinetuneRequest, background_tasks: BackgroundT
         raise HTTPException(status_code=409, detail="사용 가능한 GPU가 없습니다.")
 
     # Build command
+    # 모델 alias 해석
+    resolved_model = resolve_model_name(request.model)
+
     cmd = [
         sys.executable, str(FINETUNE_SCRIPT),
-        "--model", request.model,
+        "--model", resolved_model,
         "--dataset", request.dataset_path,
         "--output-dir", str(output_dir),
         "--epochs", str(request.epochs),
