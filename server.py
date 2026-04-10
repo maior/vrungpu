@@ -57,7 +57,11 @@ LLM_STARTUP_TIMEOUT = 120  # LLM 서버 시작 대기 시간 (초)
 # 모델 alias → 실제 경로 매핑 (짧은 이름으로 호출 가능)
 MODEL_ALIASES = {
     "Qwen/Qwen3.5-9B": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B",
+    "Qwen/Qwen2.5-7B-Instruct": "/home/maiordba/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
+    "qwen2.5-7b": "/home/maiordba/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28",
     "qwen3.5-9b": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B",
+    "Qwen/Qwen2.5-VL-7B-Instruct": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen2.5-VL-7B-Instruct",
+    "qwen2.5-vl-7b": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen2.5-VL-7B-Instruct",
     "Qwen/Qwen3-8B": "Qwen/Qwen3-8B",
     "qwen3-8b": "Qwen/Qwen3-8B",
     "deepseek-7b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
@@ -1002,6 +1006,15 @@ async def get_usage_help():
                     "note": "기본 모델 (로컬 설치됨, 파인튜닝 지원)"
                 },
                 {
+                    "name": "Qwen/Qwen2.5-VL-7B-Instruct",
+                    "alias": "qwen2.5-vl-7b",
+                    "size": "7B",
+                    "vram": "~16GB (fp16)",
+                    "quantization": "불필요",
+                    "note": "Vision-Language 모델 (이미지/비디오 + 텍스트). /llm/chat 미지원, /run/async로 직접 사용",
+                    "type": "vision-language"
+                },
+                {
                     "name": "Qwen/Qwen3-8B",
                     "alias": "qwen3-8b",
                     "size": "8B",
@@ -1118,6 +1131,45 @@ print(response.json())'''
   }' '''
             },
 
+            "run_project": {
+                "description": "프로젝트 ZIP 업로드 후 실행 (학습 코드/모델 등)",
+                "endpoint": "POST /run/project",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/run/project" \\
+  -F "file=@my_project.zip" \\
+  -F "name=my_training" \\
+  -F "entry_point=train.py" \\
+  -F "gpu_id=0"''',
+                "note": "ZIP 내 entry_point 파일을 실행. [PROGRESS:50.0:msg] 형식으로 진행률 보고 가능"
+            },
+
+            "vision_language": {
+                "description": "Qwen2.5-VL 비전-언어 모델 사용 (이미지/비디오 + 텍스트)",
+                "endpoint": "POST /run/async",
+                "code_example": '''import torch
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+model_path = "/home/maiordba/.cache/huggingface/models/Qwen--Qwen2.5-VL-7B-Instruct"
+model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    model_path, torch_dtype=torch.float16, device_map="auto"
+)
+processor = AutoProcessor.from_pretrained(model_path)
+
+messages = [{
+    "role": "user",
+    "content": [
+        {"type": "image", "image": "https://example.com/img.jpg"},
+        {"type": "text", "text": "이 이미지를 설명해줘"},
+    ],
+}]
+text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+image_inputs, _ = process_vision_info(messages)
+inputs = processor(text=[text], images=image_inputs, return_tensors="pt").to("cuda")
+output = model.generate(**inputs, max_new_tokens=512)
+print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0])''',
+                "note": "/llm/chat 미지원. /run/async에 위 코드를 보내서 사용. qwen-vl-utils, av 패키지 설치됨. 이미지 형식: URL, file://, base64 모두 지원"
+            },
+
             "check_task": {
                 "description": "작업 상태 확인",
                 "endpoint": "GET /task/{task_id}",
@@ -1173,7 +1225,8 @@ print(response.json())'''
 
         "notes": [
             "기본 모델: Qwen3.5-9B (model 파라미터 없이 /llm/chat 호출 시 자동 시작)",
-            "모델 alias 지원: qwen3.5-9b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b 등",
+            "모델 alias 지원: qwen3.5-9b, qwen2.5-vl-7b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b 등",
+            "Vision-Language: qwen2.5-vl-7b는 이미지/비디오 입력 지원. /llm/chat 미지원, /run/async로 직접 사용 (api_examples.vision_language 참조)",
             "GPU 2개 환경: LLM과 Training/Fine-tuning이 각각 다른 GPU에서 동시 실행 가능",
             "LLM/파인튜닝 시작 시 gpu_pool에서 GPU를 예약하며, 종료 시 자동 반환됩니다.",
             "파인튜닝: PEFT fp16 LoRA 방식 (QLoRA 4-bit 미사용). V100 호환.",
