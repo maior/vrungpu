@@ -77,6 +77,7 @@ def resolve_model_name(model: str) -> str:
 
 # Fine-Tuning Config
 FINETUNE_SCRIPT = Path(__file__).parent / "finetune_worker.py"
+FINETUNE_DPO_SCRIPT = Path(__file__).parent / "finetune_dpo_worker.py"
 FINETUNE_DIR = MODELS_DIR / "finetune"
 
 # 디렉토리 생성
@@ -305,6 +306,21 @@ class FinetuneRequest(BaseModel):
     max_seq_length: int = Field(default=512, ge=64, le=4096)
     gpu: int | None = Field(default=None, description="GPU ID (None=auto)")
     name: str | None = Field(default=None, description="작업 이름")
+
+
+class DPOFinetuneRequest(BaseModel):
+    model: str = Field(..., description="Base 모델 경로/alias/HuggingFace ID")
+    dataset_path: str = Field(..., description="JSONL 데이터셋 경로 (prompt/chosen/rejected)")
+    epochs: int = Field(default=1, ge=1, le=20)
+    beta: float = Field(default=0.1, gt=0, le=1.0, description="DPO 온도 파라미터")
+    lora_r: int = Field(default=16, ge=4, le=128)
+    lora_alpha: int = Field(default=32, ge=1, le=256)
+    learning_rate: float = Field(default=5e-6, gt=0, le=1.0)
+    batch_size: int = Field(default=2, ge=1, le=16)
+    grad_accum: int = Field(default=4, ge=1, le=64)
+    max_seq_length: int = Field(default=512, ge=64, le=4096)
+    gpu: int | None = Field(default=None)
+    name: str | None = Field(default=None)
 
 
 class FinetuneStatus(BaseModel):
@@ -651,7 +667,7 @@ init_database()
 app = FastAPI(
     title="VrunGPU",
     description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리 + LLM Chat)",
-    version="0.5.0",
+    version="0.6.0",
 )
 
 app.add_middleware(
@@ -811,30 +827,58 @@ async def run_task_with_streaming(
         )
 
         async def read_stream(stream, lines, stream_name):
-            while True:
-                line = await stream.readline()
-                if not line:
-                    break
-                decoded = line.decode("utf-8", errors="replace")
-                lines.append(decoded)
+            # 청크 기반 읽기: readline()의 LimitOverrunError(64KB) 회피.
+            # tqdm의 '\r' 갱신, 긴 단일 라인 JSON 로그 모두 안전하게 처리.
+            buf = b""
+            CHUNK = 65536
+            MAX_BUF = 4 * 1024 * 1024  # 4MB: 구분자 없는 병적 출력 방지
 
-                # 진행률 파싱 (특별한 형식: [PROGRESS:50.5:Training epoch 5/10])
+            async def _emit(decoded: str):
+                lines.append(decoded)
                 if decoded.startswith("[PROGRESS:"):
                     try:
-                        parts = decoded[10:-2].split(":", 1)
+                        body = decoded.rstrip("\r\n")
+                        if body.endswith("]"):
+                            body = body[:-1]
+                        parts = body[10:].split(":", 1)
                         task.progress = float(parts[0])
                         task.progress_message = parts[1] if len(parts) > 1 else None
                         save_task(task)
-                    except:
+                    except Exception:
                         pass
-
-                # 실시간 스트리밍
                 await broadcast({
                     "type": "task_output",
                     "task_id": task_id,
                     "stream": stream_name,
                     "line": decoded,
                 })
+
+            while True:
+                chunk = await stream.read(CHUNK)
+                if not chunk:
+                    if buf:
+                        await _emit(buf.decode("utf-8", errors="replace"))
+                    break
+                buf += chunk
+                # \n 또는 \r 기준으로 완결된 라인만 방출
+                while True:
+                    n_idx = buf.find(b"\n")
+                    r_idx = buf.find(b"\r")
+                    if n_idx == -1 and r_idx == -1:
+                        break
+                    if n_idx == -1:
+                        idx = r_idx
+                    elif r_idx == -1:
+                        idx = n_idx
+                    else:
+                        idx = min(n_idx, r_idx)
+                    line = buf[: idx + 1]
+                    buf = buf[idx + 1 :]
+                    await _emit(line.decode("utf-8", errors="replace"))
+                # 개행 없이 버퍼가 과도하게 커지면 강제 플러시
+                if len(buf) >= MAX_BUF:
+                    await _emit(buf.decode("utf-8", errors="replace"))
+                    buf = b""
 
         try:
             gather_task = asyncio.gather(
@@ -973,7 +1017,7 @@ async def root():
     return {
         "service": "VrunGPU",
         "status": "running",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "gpu_count": pool_status["total_gpus"],
         "available_gpus": len(pool_status["available_gpus"]),
         "total_tasks": total_tasks,
@@ -991,7 +1035,7 @@ async def get_usage_help():
     """VrunGPU 사용방법 문서 (원격 조회 가능)"""
     return {
         "service": "VrunGPU",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "description": "원격 GPU 학습/추론 실행 서버 + LLM Chat API",
 
         "llm_models": {
@@ -1099,18 +1143,51 @@ print(response.json())'''
             },
 
             "finetune": {
-                "description": "LoRA 파인튜닝 시작",
+                "description": "LoRA 파인튜닝 시작 (SFT)",
                 "endpoint": "POST /llm/finetune",
                 "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/finetune" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "model": "/home/maiordba/.cache/huggingface/models/Qwen--Qwen3.5-9B",
+    "model": "qwen3.5-9b",
     "dataset_path": "/path/to/train.jsonl",
     "epochs": 3,
     "lora_r": 16,
     "gpu": 1
   }' ''',
                 "note": "PEFT fp16 LoRA. V100 32GB에서 Qwen3.5-9B 학습 가능. 진행 상황: GET /llm/finetune/status?task_id={ID}"
+            },
+
+            "finetune_dpo": {
+                "description": "DPO 파인튜닝 (LoRA + TRL DPOTrainer, RLHF 선호도 학습)",
+                "endpoint": "POST /llm/finetune/dpo",
+                "dataset_format": '{"prompt": "...", "chosen": "...", "rejected": "..."}  (JSONL)',
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/finetune/dpo" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "qwen2.5-7b",
+    "dataset_path": "/path/to/pairs.jsonl",
+    "epochs": 1,
+    "beta": 0.1,
+    "lora_r": 16,
+    "batch_size": 2,
+    "grad_accum": 4,
+    "learning_rate": 5e-6
+  }' ''',
+                "note": "ref_model=None (LoRA adapter disable 로 base 자동 공유 → VRAM 절약). 진행 상황 조회는 /llm/finetune/status 공용"
+            },
+
+            "upload_file": {
+                "description": "임의 파일 업로드 (base64 embed 불필요). 반환 path를 /llm/finetune, /run/async 등에서 그대로 사용",
+                "endpoint": "POST /upload",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/upload" \\
+  -F "file=@/local/path/dataset.jsonl"''',
+                "response_example": '{"file_id": "...", "path": "/home/maiordba/projects/vrungpu/data/uploads/<id>/dataset.jsonl", "size": 12345, "sha256": "..."}',
+                "related": [
+                    "GET  /uploads - 업로드 목록",
+                    "GET  /upload/{file_id} - 메타 조회",
+                    "GET  /upload/{file_id}/download - 파일 다운로드",
+                    "DELETE /upload/{file_id} - 삭제"
+                ]
             },
 
             "finetune_model_start": {
@@ -1189,10 +1266,18 @@ print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special
                 "DELETE /llm/session/{id} - 세션 삭제"
             ],
             "Fine-Tuning API": [
-                "POST /llm/finetune - LoRA 파인튜닝 시작 (model, dataset_path, epochs, lora_r 등)",
+                "POST /llm/finetune - SFT LoRA 파인튜닝 (model, dataset_path, epochs, lora_r 등)",
+                "POST /llm/finetune/dpo - DPO LoRA 파인튜닝 (prompt/chosen/rejected JSONL, beta)",
                 "GET  /llm/finetune/status?task_id={id} - 파인튜닝 진행 상황 (loss, epoch, step)",
                 "POST /llm/finetune/stop?task_id={id} - 파인튜닝 중단 (체크포인트 저장)",
                 "GET  /llm/finetune/models - 파인튜닝된 모델 목록"
+            ],
+            "Upload API": [
+                "POST /upload - 임의 파일 업로드 (multipart, base64 우회 불필요)",
+                "GET  /uploads - 업로드 목록",
+                "GET  /upload/{file_id} - 메타 조회",
+                "GET  /upload/{file_id}/download - 다운로드",
+                "DELETE /upload/{file_id} - 삭제"
             ],
             "Training API": [
                 "POST /run/sync - 동기 실행 (결과 대기)",
@@ -1440,6 +1525,126 @@ async def run_project(
         status=TaskStatus.PENDING,
         message=f"프로젝트가 업로드되었습니다. Entry: {entry_point}",
     )
+
+
+# ============================================================================
+# API Endpoints - File Upload (base64 우회 불필요, 범용 파일 스토리지)
+# ============================================================================
+
+def _safe_filename(name: str) -> str:
+    """업로드 파일명 정제: 경로 탈출 방지 및 기본값"""
+    base = os.path.basename(name or "").strip()
+    if not base or base in (".", ".."):
+        return "upload.bin"
+    return base
+
+
+def _upload_meta(file_id: str) -> dict | None:
+    """업로드 디렉토리의 메타 파일 읽기 (없으면 디렉토리 스캔)"""
+    d = UPLOADS_DIR / file_id
+    if not d.is_dir():
+        return None
+    meta_path = d / ".meta.json"
+    if meta_path.exists():
+        try:
+            return json.loads(meta_path.read_text())
+        except Exception:
+            pass
+    # fallback: 디렉토리 내 첫 파일을 기준으로 구성
+    files = [p for p in d.iterdir() if p.is_file() and p.name != ".meta.json"]
+    if not files:
+        return None
+    p = files[0]
+    return {
+        "file_id": file_id,
+        "filename": p.name,
+        "path": str(p),
+        "size": p.stat().st_size,
+        "uploaded_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+        "sha256": None,
+    }
+
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """임의 파일 업로드 (multipart streaming). base64 embed 우회용.
+
+    반환 path를 /llm/finetune, /run/async 등에서 그대로 참조 가능.
+    """
+    import hashlib
+    file_id = str(uuid.uuid4())
+    filename = _safe_filename(file.filename)
+    save_dir = UPLOADS_DIR / file_id
+    save_dir.mkdir(parents=True, exist_ok=True)
+    dest = save_dir / filename
+
+    hasher = hashlib.sha256()
+    size = 0
+    try:
+        async with aiofiles.open(dest, "wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                hasher.update(chunk)
+                size += len(chunk)
+                await f.write(chunk)
+    except Exception as e:
+        shutil.rmtree(save_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"업로드 실패: {e}")
+
+    meta = {
+        "file_id": file_id,
+        "filename": filename,
+        "path": str(dest),
+        "size": size,
+        "sha256": hasher.hexdigest(),
+        "content_type": file.content_type,
+        "uploaded_at": datetime.now().isoformat(),
+    }
+    (save_dir / ".meta.json").write_text(json.dumps(meta, ensure_ascii=False))
+    return meta
+
+
+@app.get("/uploads")
+async def list_uploads(limit: int = Query(default=100, le=1000)):
+    """업로드된 파일 목록 (최신순)"""
+    if not UPLOADS_DIR.exists():
+        return []
+    entries = []
+    for d in UPLOADS_DIR.iterdir():
+        if not d.is_dir():
+            continue
+        meta = _upload_meta(d.name)
+        if meta:
+            entries.append(meta)
+    entries.sort(key=lambda m: m.get("uploaded_at", ""), reverse=True)
+    return entries[:limit]
+
+
+@app.get("/upload/{file_id}")
+async def get_upload(file_id: str):
+    """업로드 메타 조회"""
+    meta = _upload_meta(file_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    return meta
+
+
+@app.get("/upload/{file_id}/download")
+async def download_upload(file_id: str):
+    """업로드 파일 다운로드"""
+    meta = _upload_meta(file_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    return FileResponse(meta["path"], filename=meta["filename"])
+
+
+@app.delete("/upload/{file_id}")
+async def delete_upload(file_id: str):
+    """업로드 파일 삭제"""
+    d = UPLOADS_DIR / file_id
+    if not d.is_dir():
+        raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.")
+    shutil.rmtree(d, ignore_errors=True)
+    return {"message": "deleted", "file_id": file_id}
 
 
 @app.get("/task/{task_id}", response_model=TaskResult)
@@ -1999,37 +2204,58 @@ async def monitor_finetune(task_id: str, process, assigned_gpu: int):
     import re
     job = finetune_jobs[task_id]
 
+    def _handle(text: str):
+        if not text:
+            return
+        m = re.match(r"\[PROGRESS:([\d.]+):(.*)\]", text)
+        if m:
+            job["progress"] = float(m.group(1))
+        m = re.match(r"\[FINETUNE:(.*)\]", text)
+        if m:
+            pairs = dict(p.split("=", 1) for p in m.group(1).split(",") if "=" in p)
+            if "epoch" in pairs:
+                job["epoch"] = int(pairs["epoch"])
+            if "step" in pairs:
+                job["step"] = int(pairs["step"])
+            if "loss" in pairs:
+                job["loss"] = float(pairs["loss"])
+            if "total_steps" in pairs:
+                job["total_steps"] = int(pairs["total_steps"])
+            if "total_epochs" in pairs:
+                job["total_epochs"] = int(pairs["total_epochs"])
+            if "status" in pairs:
+                if pairs["status"] in ("completed", "failed", "cancelled"):
+                    job["status"] = pairs["status"]
+
     try:
+        # 청크 기반 읽기: tqdm '\r' 갱신 등 긴 단일 라인에서도 LimitOverrunError 없음.
+        buf = b""
+        CHUNK = 65536
+        MAX_BUF = 4 * 1024 * 1024
         while True:
-            line = await process.stdout.readline()
-            if not line:
+            chunk = await process.stdout.read(CHUNK)
+            if not chunk:
+                if buf:
+                    _handle(buf.decode("utf-8", errors="replace").strip())
                 break
-            text = line.decode("utf-8", errors="replace").strip()
-            if not text:
-                continue
-
-            # Parse [PROGRESS:xx.x:message]
-            m = re.match(r"\[PROGRESS:([\d.]+):(.*)\]", text)
-            if m:
-                job["progress"] = float(m.group(1))
-
-            # Parse [FINETUNE:key=val,...]
-            m = re.match(r"\[FINETUNE:(.*)\]", text)
-            if m:
-                pairs = dict(p.split("=", 1) for p in m.group(1).split(",") if "=" in p)
-                if "epoch" in pairs:
-                    job["epoch"] = int(pairs["epoch"])
-                if "step" in pairs:
-                    job["step"] = int(pairs["step"])
-                if "loss" in pairs:
-                    job["loss"] = float(pairs["loss"])
-                if "total_steps" in pairs:
-                    job["total_steps"] = int(pairs["total_steps"])
-                if "total_epochs" in pairs:
-                    job["total_epochs"] = int(pairs["total_epochs"])
-                if "status" in pairs:
-                    if pairs["status"] in ("completed", "failed", "cancelled"):
-                        job["status"] = pairs["status"]
+            buf += chunk
+            while True:
+                n_idx = buf.find(b"\n")
+                r_idx = buf.find(b"\r")
+                if n_idx == -1 and r_idx == -1:
+                    break
+                if n_idx == -1:
+                    idx = r_idx
+                elif r_idx == -1:
+                    idx = n_idx
+                else:
+                    idx = min(n_idx, r_idx)
+                line = buf[: idx + 1]
+                buf = buf[idx + 1 :]
+                _handle(line.decode("utf-8", errors="replace").strip())
+            if len(buf) >= MAX_BUF:
+                _handle(buf.decode("utf-8", errors="replace").strip())
+                buf = b""
 
     except Exception as e:
         print(f"[Finetune Monitor] Error: {e}")
@@ -2135,6 +2361,89 @@ async def start_finetune(request: FinetuneRequest, background_tasks: BackgroundT
         "gpu_id": assigned_gpu,
         "output_dir": str(output_dir),
         "message": f"파인튜닝 시작됨. GET /llm/finetune/status?task_id={task_id} 로 진행 상황 확인",
+    }
+
+
+@app.post("/llm/finetune/dpo")
+async def start_finetune_dpo(request: DPOFinetuneRequest, background_tasks: BackgroundTasks):
+    """DPO 파인튜닝 시작 (LoRA + TRL DPOTrainer, ref_model 자동 공유로 V100 VRAM 절약)"""
+
+    if not FINETUNE_DPO_SCRIPT.exists():
+        raise HTTPException(status_code=500, detail="finetune_dpo_worker.py를 찾을 수 없습니다.")
+    if not Path(request.dataset_path).exists():
+        raise HTTPException(status_code=400, detail=f"데이터셋을 찾을 수 없습니다: {request.dataset_path}")
+
+    task_id = str(uuid.uuid4())[:8]
+    output_dir = FINETUNE_DIR / task_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ft_task_id = f"{FINETUNE_TASK_PREFIX}{task_id}__"
+    assigned_gpu = gpu_pool.acquire(ft_task_id, request.gpu)
+    if assigned_gpu is None:
+        if request.gpu is not None:
+            raise HTTPException(status_code=409, detail=f"GPU {request.gpu}이(가) 사용 중입니다.")
+        raise HTTPException(status_code=409, detail="사용 가능한 GPU가 없습니다.")
+
+    resolved_model = resolve_model_name(request.model)
+
+    cmd = [
+        sys.executable, str(FINETUNE_DPO_SCRIPT),
+        "--model", resolved_model,
+        "--dataset", request.dataset_path,
+        "--output-dir", str(output_dir),
+        "--epochs", str(request.epochs),
+        "--beta", str(request.beta),
+        "--lora-r", str(request.lora_r),
+        "--lora-alpha", str(request.lora_alpha),
+        "--learning-rate", str(request.learning_rate),
+        "--batch-size", str(request.batch_size),
+        "--grad-accum", str(request.grad_accum),
+        "--max-seq-length", str(request.max_seq_length),
+    ]
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+
+    process = await asyncio.subprocess.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=env,
+        cwd=str(FINETUNE_DPO_SCRIPT.parent),
+    )
+
+    finetune_jobs[task_id] = {
+        "task_id": task_id,
+        "process": process,
+        "status": "running",
+        "mode": "dpo",
+        "model": request.model,
+        "name": request.name,
+        "gpu_id": assigned_gpu,
+        "epoch": 0,
+        "total_epochs": request.epochs,
+        "step": 0,
+        "total_steps": 0,
+        "loss": None,
+        "progress": 0,
+        "output_dir": str(output_dir),
+        "config": request.model_dump(),
+        "started_at": datetime.now().isoformat(),
+        "_start_time": time.time(),
+        "elapsed_seconds": None,
+    }
+
+    background_tasks.add_task(monitor_finetune, task_id, process, assigned_gpu)
+
+    print(f"[Finetune-DPO] {task_id} started: {request.model} on GPU {assigned_gpu} (beta={request.beta})")
+    return {
+        "task_id": task_id,
+        "status": "running",
+        "mode": "dpo",
+        "model": request.model,
+        "gpu_id": assigned_gpu,
+        "output_dir": str(output_dir),
+        "message": f"DPO 파인튜닝 시작됨. GET /llm/finetune/status?task_id={task_id} 로 진행 상황 확인",
     }
 
 

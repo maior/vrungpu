@@ -15,13 +15,16 @@ Remote GPU execution server for training and inference. Send Python code from yo
 - **Sync/Async Execution**: Sync for quick tasks, async for long training jobs
 - **Multi-GPU Support**: Automatic job distribution across multiple GPUs
 - **ZIP Project Upload**: Upload multiple Python files + datasets as a ZIP archive
+- **File Upload API**: Streaming multipart upload for datasets/checkpoints — no base64 embed workaround
 - **WebSocket Streaming**: Real-time training logs via WebSocket
 - **Web Dashboard**: Visual monitoring of GPU status and tasks (D3.js charts)
 - **SQLite Persistence**: Task and model data survives server restarts
 - **Model Registry**: Register, query, and download trained models
 - **Inference API**: Run inference on registered models
 - **Progress Tracking**: Real-time training progress monitoring
-- **LLM Chat API**: Built-in LLM inference service (Qwen2.5/Qwen3 support)
+- **LLM Chat API**: Built-in LLM inference service (Qwen2.5/Qwen3/Qwen3.5, Vision-Language)
+- **Fine-Tuning**: SFT LoRA + DPO (RLHF) with TRL DPOTrainer, V100-compatible fp16
+- **Session Management**: Server-side multi-turn chat sessions with TTL
 - **Auto GPU Switching**: LLM and training jobs share GPU automatically
 
 ## Who is this for?
@@ -326,15 +329,18 @@ Built-in LLM inference service with automatic GPU management. Supports Qwen2.5 a
 
 ### Supported Models
 
-| Model | HuggingFace Name | VRAM (FP16) | Note |
-|-------|------------------|-------------|------|
-| Qwen2.5-3B | `Qwen/Qwen2.5-3B-Instruct` | ~8GB | |
-| Qwen2.5-7B | `Qwen/Qwen2.5-7B-Instruct` | ~16GB | |
-| Qwen3-8B | `Qwen/Qwen3-8B` | ~18GB | 기본 모델 |
-| DeepSeek-R1-7B (Qwen) | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | ~16GB | |
-| DeepSeek-R1-8B (Llama) | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | ~18GB | |
-| DeepSeek-R1-14B | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | ~28GB | V100 32GB 권장 |
-| GPT-OSS-20B | `openai/gpt-oss-20b` | ~41GB | OpenAI, Apache 2.0 |
+Model aliases (short names) are accepted wherever a model name is expected.
+
+| Model | Alias | HuggingFace Name | VRAM (FP16) | Note |
+|-------|-------|------------------|-------------|------|
+| Qwen3.5-9B | `qwen3.5-9b` | `Qwen/Qwen3.5-9B` | ~18GB | Default, fine-tuning ready |
+| Qwen2.5-7B | `qwen2.5-7b` | `Qwen/Qwen2.5-7B-Instruct` | ~16GB | |
+| Qwen2.5-VL-7B | `qwen2.5-vl-7b` | `Qwen/Qwen2.5-VL-7B-Instruct` | ~16GB | Vision-Language (use `/run/async`) |
+| Qwen3-8B | `qwen3-8b` | `Qwen/Qwen3-8B` | ~18GB | |
+| DeepSeek-R1-7B (Qwen) | `deepseek-7b` | `deepseek-ai/DeepSeek-R1-Distill-Qwen-7B` | ~16GB | |
+| DeepSeek-R1-8B (Llama) | `deepseek-8b` | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` | ~18GB | |
+| DeepSeek-R1-14B | `deepseek-14b` | `deepseek-ai/DeepSeek-R1-Distill-Qwen-14B` | ~28GB | V100 32GB recommended |
+| GPT-OSS-20B | `gpt-oss-20b` | `openai/gpt-oss-20b` | ~41GB | MXFP4 → BF16 dequant for V100 |
 
 ### Start LLM Service
 
@@ -422,6 +428,173 @@ print(response.json()["generated_text"])
 
 # Stop when done
 requests.post(f"{SERVER}/llm/stop")
+```
+
+---
+
+## File Upload API
+
+Upload arbitrary files (datasets, checkpoints, configs) via streaming multipart. The returned `path` can be reused directly in `/llm/finetune`, `/llm/finetune/dpo`, `/run/async`, etc. — no base64 embedding in your code.
+
+### Upload a File
+
+```bash
+curl -X POST http://your-server:9825/upload \
+  -F "file=@/local/path/dataset.jsonl"
+```
+
+Response:
+```json
+{
+  "file_id": "f3a1...",
+  "filename": "dataset.jsonl",
+  "path": "/home/maiordba/projects/vrungpu/data/uploads/f3a1.../dataset.jsonl",
+  "size": 12345,
+  "sha256": "9a4961...",
+  "uploaded_at": "2026-04-13T09:34:39"
+}
+```
+
+### Manage Uploads
+
+```bash
+curl http://your-server:9825/uploads                          # list
+curl http://your-server:9825/upload/{file_id}                 # metadata
+curl -O http://your-server:9825/upload/{file_id}/download     # download
+curl -X DELETE http://your-server:9825/upload/{file_id}       # delete
+```
+
+### Python Example
+
+```python
+import requests
+
+SERVER = "http://your-server:9825"
+
+# Upload dataset
+with open("pairs.jsonl", "rb") as f:
+    r = requests.post(f"{SERVER}/upload", files={"file": f})
+dataset_path = r.json()["path"]
+
+# Use it in fine-tuning directly
+requests.post(f"{SERVER}/llm/finetune/dpo", json={
+    "model": "qwen2.5-7b",
+    "dataset_path": dataset_path,
+    "epochs": 1,
+    "beta": 0.1,
+})
+```
+
+---
+
+## Fine-Tuning API
+
+LoRA-based fine-tuning with PEFT. Two modes: **SFT** (supervised) and **DPO** (preference learning / RLHF). Both V100-compatible fp16 with AMP GradScaler.
+
+### SFT Fine-Tuning
+
+Dataset formats auto-detected (JSONL):
+- `{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}`
+- `{"instruction": "...", "input": "...", "output": "..."}` (Alpaca)
+- `{"text": "..."}` (raw)
+
+```bash
+curl -X POST http://your-server:9825/llm/finetune \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen3.5-9b",
+    "dataset_path": "/path/to/train.jsonl",
+    "epochs": 3,
+    "lora_r": 16,
+    "learning_rate": 2e-4,
+    "batch_size": 4,
+    "gpu": 1
+  }'
+```
+
+### DPO Fine-Tuning (RLHF)
+
+Preference-pair dataset (JSONL):
+```json
+{"prompt": "What is 2+2?", "chosen": "2+2 equals 4.", "rejected": "idk lol"}
+```
+
+```bash
+curl -X POST http://your-server:9825/llm/finetune/dpo \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-7b",
+    "dataset_path": "/path/to/pairs.jsonl",
+    "epochs": 1,
+    "beta": 0.1,
+    "lora_r": 16,
+    "batch_size": 2,
+    "grad_accum": 4,
+    "learning_rate": 5e-6
+  }'
+```
+
+Uses TRL `DPOTrainer` with `ref_model=None` — the LoRA adapter is disabled to reuse the base model as reference, saving VRAM (critical on V100 32GB).
+
+### Progress Monitoring (shared by SFT/DPO)
+
+```bash
+curl "http://your-server:9825/llm/finetune/status?task_id={task_id}"
+```
+
+Response includes `epoch`, `step`, `total_steps`, `loss`, `progress`, and for DPO also reward margins via training logs.
+
+### Stop Fine-Tuning
+
+```bash
+# Graceful stop (saves checkpoint)
+curl -X POST "http://your-server:9825/llm/finetune/stop?task_id={task_id}"
+```
+
+### Use the Fine-Tuned Adapter
+
+```bash
+# Start LLM with the adapter merged in
+curl -X POST "http://your-server:9825/llm/start?model=qwen3.5-9b&lora_adapter={task_id}&gpu=1"
+
+# Then chat normally via /llm/chat
+```
+
+### End-to-End Python Example
+
+```python
+import requests
+SERVER = "http://your-server:9825"
+
+# 1. Upload preference pairs
+with open("pairs.jsonl", "rb") as f:
+    dataset_path = requests.post(f"{SERVER}/upload", files={"file": f}).json()["path"]
+
+# 2. Start DPO
+job = requests.post(f"{SERVER}/llm/finetune/dpo", json={
+    "model": "qwen2.5-7b",
+    "dataset_path": dataset_path,
+    "epochs": 1, "beta": 0.1, "lora_r": 16,
+}).json()
+task_id = job["task_id"]
+
+# 3. Poll status
+import time
+while True:
+    s = requests.get(f"{SERVER}/llm/finetune/status", params={"task_id": task_id}).json()
+    print(f"{s['status']} {s['progress']:.1f}% loss={s['loss']}")
+    if s["status"] in ("completed", "failed", "cancelled"):
+        break
+    time.sleep(5)
+
+# 4. Serve the DPO-trained adapter
+requests.post(f"{SERVER}/llm/start", params={
+    "model": "qwen2.5-7b", "lora_adapter": task_id, "gpu": 0,
+})
+reply = requests.post(f"{SERVER}/llm/chat", json={
+    "messages": [{"role": "user", "content": "What is 2+2?"}]
+}).json()
+print(reply["generated_text"])
 ```
 
 ---
@@ -548,6 +721,26 @@ print(f"Task started: {task_id}")
 | `/task/{task_id}` | DELETE | Delete task |
 | `/task/{task_id}/progress` | PUT | Manual progress update |
 
+### File Upload Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/upload` | POST | Upload arbitrary file (streaming multipart) |
+| `/uploads` | GET | List uploaded files |
+| `/upload/{file_id}` | GET | Get upload metadata |
+| `/upload/{file_id}/download` | GET | Download uploaded file |
+| `/upload/{file_id}` | DELETE | Delete uploaded file |
+
+### Fine-Tuning Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/llm/finetune` | POST | Start SFT LoRA fine-tuning |
+| `/llm/finetune/dpo` | POST | Start DPO LoRA fine-tuning (RLHF) |
+| `/llm/finetune/status` | GET | Fine-tuning progress (shared SFT/DPO) |
+| `/llm/finetune/stop` | POST | Graceful stop with checkpoint save |
+| `/llm/finetune/models` | GET | List fine-tuned adapter models |
+
 ### Model Management Endpoints
 
 | Endpoint | Method | Description |
@@ -563,11 +756,14 @@ print(f"Task started: {task_id}")
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/llm/start` | POST | Start LLM service (params: model, gpu) |
+| `/llm/start` | POST | Start LLM service (params: model, gpu, lora_adapter) |
 | `/llm/stop` | POST | Stop LLM service |
 | `/llm/status` | GET | Get LLM service status |
 | `/llm/generate` | POST | Text generation (auto-starts LLM) |
-| `/llm/chat` | POST | Chat completion (auto-starts LLM) |
+| `/llm/chat` | POST | Chat completion (auto-starts LLM, session_id supported) |
+| `/llm/sessions` | GET | List active chat sessions |
+| `/llm/session/{id}` | GET | Get session history |
+| `/llm/session/{id}` | DELETE | Delete session |
 
 ---
 
@@ -804,7 +1000,8 @@ Response:
 
 ## Version History
 
-- **v0.5.0** - LLM Chat API (Qwen2.5/Qwen3), auto GPU switching, bitsandbytes/peft support
+- **v0.6.0** - File Upload API, DPO fine-tuning (TRL DPOTrainer + LoRA), fix for asyncio `LimitOverrunError` ("Separator is not found") on large subprocess output / tqdm progress bars
+- **v0.5.0** - LLM Chat API (Qwen2.5/Qwen3/Qwen3.5, Qwen2.5-VL), SFT LoRA fine-tuning, server-side chat sessions, model aliases, auto GPU switching
 - **v0.4.0** - SQLite persistence, model management API, inference API, progress tracking
 - **v0.3.0** - D3.js dashboard with smooth animations
 - **v0.2.0** - ZIP project upload, multi-GPU support
