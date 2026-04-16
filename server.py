@@ -287,12 +287,22 @@ class LLMChatRequest(BaseModel):
     ei_gate: bool = Field(default=False, description="E-I gate computation")
 
 
+class LLMInstanceInfo(BaseModel):
+    gpu_id: int
+    model: str | None = None
+    port: int
+    pid: int | None = None
+    running: bool = False
+
+
 class LLMServiceStatus(BaseModel):
     running: bool
+    instances: list[LLMInstanceInfo] = []
+    # 하위 호환: 단일 인스턴스 필드 (첫 번째 실행 중인 인스턴스 기준)
     model: str | None = None
     port: int = LLM_SERVER_PORT
     pid: int | None = None
-    message: str = "LLM API는 /llm/generate, /llm/chat 엔드포인트를 통해 호출하세요"
+    message: str = "LLM API는 /llm/generate, /llm/chat 엔드포인트를 통해 호출하세요. gpu 파라미터로 인스턴스 지정 가능"
 
 
 class FinetuneRequest(BaseModel):
@@ -549,116 +559,161 @@ gpu_pool = GPUPool()
 websocket_clients: set[WebSocket] = set()
 running_tasks: dict[str, TaskResult] = {}  # 메모리 캐시 (실행 중인 작업만)
 
-# LLM Inference Server Process
-llm_process: subprocess.Popen | None = None
-llm_model_name: str | None = None
-llm_gpu_id: int | None = None  # LLM이 점유 중인 GPU ID (gpu_pool과 연동)
-llm_switching_lock = asyncio.Lock()  # LLM 서비스 전환 동기화
+# LLM Inference Server — Multi-GPU 지원
+# GPU별로 독립 인스턴스 운영, 포트 = LLM_BASE_PORT + gpu_id
+LLM_BASE_PORT = LLM_SERVER_PORT  # 9826
+
+
+class LLMInstance:
+    """GPU 한 대에 매핑된 inference_server.py 프로세스"""
+    __slots__ = ("process", "model_name", "gpu_id", "port")
+
+    def __init__(self, process: subprocess.Popen, model_name: str, gpu_id: int, port: int):
+        self.process = process
+        self.model_name = model_name
+        self.gpu_id = gpu_id
+        self.port = port
+
+    @property
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    @property
+    def url(self) -> str:
+        return f"http://localhost:{self.port}"
+
+
+llm_instances: dict[int, LLMInstance] = {}  # gpu_id → LLMInstance
+llm_switching_lock = asyncio.Lock()
+
+
+def _llm_port(gpu_id: int) -> int:
+    return LLM_BASE_PORT + gpu_id
+
+
+def _llm_task_id(gpu_id: int) -> str:
+    return f"__llm_inference_gpu{gpu_id}__"
+
+
+def _find_any_running_instance() -> LLMInstance | None:
+    """살아 있는 LLM 인스턴스 아무거나 반환 (없으면 None)"""
+    for inst in llm_instances.values():
+        if inst.alive:
+            return inst
+    return None
+
 
 # Fine-Tuning State
 finetune_jobs: dict[str, dict] = {}
 # task_id -> { process, status, model, gpu_id, epoch, total_epochs,
 #              step, total_steps, loss, progress, output_dir, config, started_at }
 FINETUNE_TASK_PREFIX = "__finetune_"
-LLM_TASK_ID = "__llm_inference__"  # gpu_pool에서 LLM 예약용 task_id
+LLM_TASK_ID = "__llm_inference__"  # 하위 호환용 (기존 gpu_pool 기록)
 
 
-async def ensure_llm_stopped():
-    """VrunGPU 작업 전 LLM 서비스 중지 (GPU 확보)"""
-    global llm_process, llm_model_name, llm_gpu_id
-
-    async with llm_switching_lock:
-        # Check if LLM is running
-        if llm_process is not None and llm_process.poll() is None:
-            print("[Auto-Switch] LLM 서비스 중지 중...")
-            llm_process.terminate()
-            try:
-                llm_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                llm_process.kill()
-                llm_process.wait()
-            llm_process = None
-            # GPU 풀에서 해제
-            if llm_gpu_id is not None:
-                gpu_pool.release(llm_gpu_id)
-                print(f"[Auto-Switch] GPU {llm_gpu_id} 풀에 반환")
-                llm_gpu_id = None
-            # llm_model_name은 유지 (재시작 시 사용)
-            print("[Auto-Switch] LLM 서비스 중지 완료")
-            await asyncio.sleep(1)  # GPU 메모리 해제 대기
-            return True
-    return False
-
-
-async def ensure_llm_running(model: str | None = None):
-    """LLM API 호출 전 LLM 서비스 자동 시작"""
-    global llm_process, llm_model_name, llm_gpu_id
-
-    async with llm_switching_lock:
-        # Check if already running
+def _stop_llm_instance(inst: LLMInstance):
+    """LLM 인스턴스 프로세스 종료 + GPU 반환 (동기, lock 밖에서 호출 가능)"""
+    if inst.alive:
+        inst.process.terminate()
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{LLM_SERVER_URL}/health")
-                if resp.status_code == 200:
-                    return True  # Already running
-        except Exception:
-            pass
+            inst.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            inst.process.kill()
+            inst.process.wait()
+    gpu_pool.release(inst.gpu_id)
+    llm_instances.pop(inst.gpu_id, None)
+    print(f"[LLM] GPU {inst.gpu_id}(port {inst.port}) 중지, 풀 반환")
 
-        # Start LLM service
-        target_model = resolve_model_name(model or llm_model_name or DEFAULT_LLM_MODEL)
-        print(f"[Auto-Switch] LLM 서비스 시작 중... ({target_model})")
+
+async def ensure_llm_stopped(gpu_id: int | None = None):
+    """VrunGPU 작업 전 LLM 서비스 중지 (GPU 확보).
+    gpu_id 지정 시 해당 GPU만, None이면 전체 인스턴스 중지."""
+
+    async with llm_switching_lock:
+        stopped = False
+        if gpu_id is not None:
+            inst = llm_instances.get(gpu_id)
+            if inst:
+                _stop_llm_instance(inst)
+                stopped = True
+        else:
+            for gid in list(llm_instances):
+                _stop_llm_instance(llm_instances[gid])
+                stopped = True
+        if stopped:
+            await asyncio.sleep(1)  # GPU 메모리 해제 대기
+        return stopped
+
+
+async def ensure_llm_running(model: str | None = None, gpu: int | None = None):
+    """LLM API 호출 전 LLM 서비스 자동 시작.
+    이미 살아 있는 인스턴스가 있으면 그것을 반환."""
+
+    async with llm_switching_lock:
+        # 이미 실행 중인 인스턴스가 있으면 재활용
+        if gpu is not None and gpu in llm_instances and llm_instances[gpu].alive:
+            return llm_instances[gpu]
+        # gpu 미지정 → 아무 살아있는 인스턴스
+        inst = _find_any_running_instance()
+        if inst:
+            return inst
+
+        # 죽은 인스턴스 정리
+        for gid in list(llm_instances):
+            if not llm_instances[gid].alive:
+                gpu_pool.release(gid)
+                llm_instances.pop(gid)
+
+        target_model = resolve_model_name(model or DEFAULT_LLM_MODEL)
+        target_gpu = gpu if gpu is not None else DEFAULT_LLM_GPU
+        port = _llm_port(target_gpu)
+        task_id = _llm_task_id(target_gpu)
+
+        print(f"[Auto-Switch] LLM 시작: {target_model} on GPU {target_gpu} (port {port})")
 
         if not LLM_SERVER_SCRIPT.exists():
             raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
 
-        # GPU 풀에서 예약
-        gpu = gpu_pool.acquire(LLM_TASK_ID, DEFAULT_LLM_GPU)
-        if gpu is None:
-            raise HTTPException(status_code=409, detail=f"GPU {DEFAULT_LLM_GPU}이(가) 사용 중입니다. LLM 서비스를 시작할 수 없습니다.")
+        acquired = gpu_pool.acquire(task_id, target_gpu)
+        if acquired is None:
+            raise HTTPException(status_code=409, detail=f"GPU {target_gpu}이(가) 사용 중입니다.")
 
-        # stdout을 로그 파일로 리다이렉트 (PIPE 버퍼 데드락 방지)
-        auto_log_path = Path("data/logs")
-        auto_log_path.mkdir(parents=True, exist_ok=True)
-        auto_log_file = open(auto_log_path / "inference_server.log", "w")
-        llm_process = subprocess.Popen(
+        log_dir = Path("data/logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = open(log_dir / f"inference_server_gpu{target_gpu}.log", "w")
+        process = subprocess.Popen(
             [sys.executable, str(LLM_SERVER_SCRIPT), "--model", target_model,
-             "--port", str(LLM_SERVER_PORT), "--gpu", str(gpu)],
-            stdout=auto_log_file,
+             "--port", str(port), "--gpu", str(target_gpu)],
+            stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
             cwd=str(LLM_SERVER_SCRIPT.parent),
         )
-        llm_model_name = target_model
-        llm_gpu_id = gpu
-        print(f"[Auto-Switch] GPU {gpu} 예약 완료")
 
-        # Wait for server to be ready
+        new_inst = LLMInstance(process, target_model, target_gpu, port)
+        llm_instances[target_gpu] = new_inst
+
+        # 서버 준비 대기
         start_time = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start_time < LLM_STARTUP_TIMEOUT:
-            if llm_process.poll() is not None:
-                log_output = (auto_log_path / "inference_server.log").read_text()[-500:]
-                # 시작 실패 시 GPU 반환
-                gpu_pool.release(llm_gpu_id)
-                print(f"[Auto-Switch] 시작 실패, GPU {llm_gpu_id} 반환")
-                llm_gpu_id = None
+            if process.poll() is not None:
+                log_output = (log_dir / f"inference_server_gpu{target_gpu}.log").read_text()[-500:]
+                gpu_pool.release(target_gpu)
+                llm_instances.pop(target_gpu, None)
                 raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {log_output}")
-
             try:
                 async with httpx.AsyncClient(timeout=2.0) as client:
-                    resp = await client.get(f"{LLM_SERVER_URL}/health")
+                    resp = await client.get(f"{new_inst.url}/health")
                     if resp.status_code == 200:
-                        print(f"[Auto-Switch] LLM 서비스 시작 완료 (PID: {llm_process.pid}, GPU: {gpu})")
-                        return True
+                        print(f"[Auto-Switch] LLM 시작 완료 (PID {process.pid}, GPU {target_gpu}, port {port})")
+                        return new_inst
             except Exception:
                 pass
-
             await asyncio.sleep(2)
 
-        # 타임아웃 시 GPU 반환
-        gpu_pool.release(llm_gpu_id)
-        print(f"[Auto-Switch] 타임아웃, GPU {llm_gpu_id} 반환")
-        llm_gpu_id = None
-        raise HTTPException(status_code=504, detail="LLM 서버 시작 타임아웃 (모델 로딩 시간 초과)")
+        gpu_pool.release(target_gpu)
+        llm_instances.pop(target_gpu, None)
+        raise HTTPException(status_code=504, detail="LLM 서버 시작 타임아웃")
 
 
 # 데이터베이스 초기화
@@ -1966,19 +2021,18 @@ async def start_llm_service(
     lora_adapter: str | None = Query(default=None, description="LoRA 어댑터 경로 (파인튜닝된 모델)"),
     ei_checkpoint: str = Query(default=None, description="E-I gate checkpoint directory"),
 ):
-    """LLM 추론 서버 시작 (Qwen3.5-9B, DeepSeek-R1 등, 파인튜닝 모델 지원)"""
-    global llm_process, llm_model_name, llm_gpu_id
-
-    # 모델 alias 해석
+    """LLM 추론 서버 시작 (GPU별 독립 인스턴스, 동시에 여러 GPU에서 실행 가능)"""
     model = resolve_model_name(model)
 
-    if llm_process is not None and llm_process.poll() is None:
-        raise HTTPException(status_code=400, detail="LLM 서비스가 이미 실행 중입니다.")
+    # 해당 GPU에 이미 인스턴스가 있는지 확인
+    existing = llm_instances.get(gpu)
+    if existing and existing.alive:
+        raise HTTPException(status_code=400, detail=f"GPU {gpu}에 이미 LLM 인스턴스가 실행 중입니다 (model={existing.model_name}, port={existing.port}). 먼저 /llm/stop?gpu={gpu} 으로 중지하세요.")
 
     if not LLM_SERVER_SCRIPT.exists():
         raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
 
-    # LoRA 어댑터 경로 해석 (shorthand 지원: finetune/{task_id})
+    # LoRA 어댑터 경로 해석
     if lora_adapter:
         adapter_path = Path(lora_adapter)
         if not adapter_path.is_absolute():
@@ -1988,135 +2042,128 @@ async def start_llm_service(
         lora_adapter = str(adapter_path)
 
     # GPU 풀에서 예약
-    assigned_gpu = gpu_pool.acquire(LLM_TASK_ID, gpu)
+    task_id = _llm_task_id(gpu)
+    assigned_gpu = gpu_pool.acquire(task_id, gpu)
     if assigned_gpu is None:
-        raise HTTPException(status_code=409, detail=f"GPU {gpu}이(가) 사용 중입니다. LLM 서비스를 시작할 수 없습니다.")
+        raise HTTPException(status_code=409, detail=f"GPU {gpu}이(가) 사용 중입니다.")
 
-    # Build command with optional quantization
-    cmd = [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(LLM_SERVER_PORT), "--gpu", str(assigned_gpu)]
+    port = _llm_port(assigned_gpu)
+    cmd = [sys.executable, str(LLM_SERVER_SCRIPT), "--model", model, "--port", str(port), "--gpu", str(assigned_gpu)]
     if load_in_4bit:
         cmd.append("--load-in-4bit")
     elif load_in_8bit:
         cmd.append("--load-in-8bit")
     if lora_adapter:
         cmd.extend(["--lora-adapter", lora_adapter])
-
-
     if ei_checkpoint:
         cmd.extend(["--ei-checkpoint", ei_checkpoint])
-    # Start the inference server as a subprocess
-    # stdout을 로그 파일로 리다이렉트 (PIPE 버퍼 데드락 방지)
-    llm_log_path = Path("data/logs")
-    llm_log_path.mkdir(parents=True, exist_ok=True)
-    llm_log_file = open(llm_log_path / "inference_server.log", "w")
-    llm_process = subprocess.Popen(
+
+    log_dir = Path("data/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_dir / f"inference_server_gpu{assigned_gpu}.log", "w")
+    process = subprocess.Popen(
         cmd,
-        stdout=llm_log_file,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         text=True,
         cwd=str(LLM_SERVER_SCRIPT.parent),
     )
-    llm_model_name = model
-    llm_gpu_id = assigned_gpu
-    print(f"[LLM] GPU {assigned_gpu} 예약, 모델: {model}")
 
-    # Wait a moment and check if it started
+    inst = LLMInstance(process, model, assigned_gpu, port)
+    llm_instances[assigned_gpu] = inst
+    print(f"[LLM] GPU {assigned_gpu} 예약 (port {port}), 모델: {model}")
+
     await asyncio.sleep(2)
-    if llm_process.poll() is not None:
-        log_output = (llm_log_path / "inference_server.log").read_text()[-500:]
-        # 시작 실패 시 GPU 반환
-        gpu_pool.release(llm_gpu_id)
-        print(f"[LLM] 시작 실패, GPU {llm_gpu_id} 반환")
-        llm_gpu_id = None
+    if process.poll() is not None:
+        log_output = (log_dir / f"inference_server_gpu{assigned_gpu}.log").read_text()[-500:]
+        gpu_pool.release(assigned_gpu)
+        llm_instances.pop(assigned_gpu, None)
         raise HTTPException(status_code=500, detail=f"LLM 서버 시작 실패: {log_output}")
 
     return LLMServiceStatus(
         running=True,
         model=model,
-        port=LLM_SERVER_PORT,
-        pid=llm_process.pid,
+        port=port,
+        pid=process.pid,
+        instances=[LLMInstanceInfo(gpu_id=assigned_gpu, model=model, port=port, pid=process.pid, running=True)],
     )
 
 
 @app.post("/llm/stop")
-async def stop_llm_service():
-    """LLM 추론 서버 중지"""
-    global llm_process, llm_model_name, llm_gpu_id
-
-    if llm_process is None or llm_process.poll() is not None:
-        # 프로세스가 이미 죽었는데 GPU가 아직 점유 중이면 회수
-        if llm_gpu_id is not None:
-            gpu_pool.release(llm_gpu_id)
-            print(f"[LLM] 이미 종료된 프로세스의 GPU {llm_gpu_id} 회수")
-            llm_gpu_id = None
-        llm_process = None
-        return {"message": "LLM 서비스가 실행 중이 아닙니다.", "running": False}
-
-    # Gracefully terminate
-    llm_process.terminate()
-    try:
-        llm_process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        llm_process.kill()
-        llm_process.wait()
-
-    llm_process = None
-    llm_model_name = None
-
-    # GPU 풀에서 해제
-    if llm_gpu_id is not None:
-        gpu_pool.release(llm_gpu_id)
-        print(f"[LLM] GPU {llm_gpu_id} 반환")
-        llm_gpu_id = None
-
-    return {"message": "LLM 서비스가 중지되었습니다.", "running": False}
+async def stop_llm_service(
+    gpu: int | None = Query(default=None, description="중지할 GPU ID (미지정 시 전체 중지)"),
+):
+    """LLM 추론 서버 중지 (gpu 지정 시 해당 GPU만, 미지정 시 전체)"""
+    if gpu is not None:
+        inst = llm_instances.get(gpu)
+        if not inst:
+            return {"message": f"GPU {gpu}에 실행 중인 LLM 인스턴스가 없습니다.", "running": False}
+        _stop_llm_instance(inst)
+        return {"message": f"GPU {gpu} LLM 인스턴스 중지됨.", "running": False, "gpu": gpu}
+    else:
+        if not llm_instances:
+            return {"message": "실행 중인 LLM 인스턴스가 없습니다.", "running": False}
+        stopped = list(llm_instances.keys())
+        for gid in list(llm_instances):
+            _stop_llm_instance(llm_instances[gid])
+        return {"message": f"LLM 전체 중지됨 (GPU: {stopped}).", "running": False}
 
 
 @app.get("/llm/status", response_model=LLMServiceStatus)
 async def get_llm_status():
-    """LLM 서비스 상태 확인"""
-    global llm_process, llm_model_name, llm_gpu_id
+    """LLM 서비스 상태 확인 (전체 GPU 인스턴스)"""
+    # 비정상 종료 감지 및 회수
+    for gid in list(llm_instances):
+        inst = llm_instances[gid]
+        if not inst.alive:
+            gpu_pool.release(gid)
+            llm_instances.pop(gid)
+            print(f"[LLM] 비정상 종료 감지, GPU {gid} 자동 회수")
 
-    running = False
-    detected_model = llm_model_name
+    instance_infos = []
+    for inst in llm_instances.values():
+        alive = inst.alive
+        model = inst.model_name
+        if alive:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(f"{inst.url}/health")
+                    alive = resp.status_code == 200
+                    if alive:
+                        # 모델명 갱신 시도 (실패해도 무시)
+                        try:
+                            r2 = await client.get(f"{inst.url}/")
+                            model = r2.json().get("model", model) if r2.status_code == 200 else model
+                        except Exception:
+                            pass
+            except Exception:
+                alive = False
+        instance_infos.append(LLMInstanceInfo(
+            gpu_id=inst.gpu_id, model=model, port=inst.port,
+            pid=inst.process.pid if inst.alive else None, running=alive,
+        ))
 
-    # 비정상 종료 감지: 프로세스가 죽었는데 GPU가 아직 점유 중이면 회수
-    if llm_process is not None and llm_process.poll() is not None:
-        if llm_gpu_id is not None:
-            gpu_pool.release(llm_gpu_id)
-            print(f"[LLM] 비정상 종료 감지, GPU {llm_gpu_id} 자동 회수")
-            llm_gpu_id = None
-        llm_process = None
-
-    # Try to ping the server (works even if started externally)
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{LLM_SERVER_URL}/")
-            if resp.status_code == 200:
-                running = True
-                data = resp.json()
-                detected_model = data.get("model", llm_model_name)
-    except Exception:
-        running = False
+    any_running = any(i.running for i in instance_infos)
+    first = next((i for i in instance_infos if i.running), None)
 
     return LLMServiceStatus(
-        running=running,
-        model=detected_model if running else None,
-        port=LLM_SERVER_PORT,
-        pid=llm_process.pid if llm_process and llm_process.poll() is None else None,
+        running=any_running,
+        instances=instance_infos,
+        model=first.model if first else None,
+        port=first.port if first else LLM_SERVER_PORT,
+        pid=first.pid if first else None,
     )
 
 
 @app.post("/llm/generate")
-async def llm_generate(request: LLMGenerateRequest):
-    """LLM 텍스트 생성 (자동 서비스 시작)"""
-    # 자동으로 LLM 서비스 시작
-    await ensure_llm_running()
+async def llm_generate(request: LLMGenerateRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
+    """LLM 텍스트 생성 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
+    inst = await ensure_llm_running(gpu=gpu)
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
-                f"{LLM_SERVER_URL}/generate",
+                f"{inst.url}/generate",
                 json=request.model_dump(),
             )
             if resp.status_code != 200:
@@ -2129,15 +2176,14 @@ async def llm_generate(request: LLMGenerateRequest):
 
 
 @app.post("/llm/chat")
-async def llm_chat(request: LLMChatRequest):
-    """LLM 채팅 (자동 서비스 시작)"""
-    # 자동으로 LLM 서비스 시작
-    await ensure_llm_running()
+async def llm_chat(request: LLMChatRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
+    """LLM 채팅 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
+    inst = await ensure_llm_running(gpu=gpu)
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
             resp = await client.post(
-                f"{LLM_SERVER_URL}/chat",
+                f"{inst.url}/chat",
                 json=request.model_dump(),
             )
             if resp.status_code != 200:
@@ -2154,45 +2200,65 @@ async def llm_chat(request: LLMChatRequest):
 # ============================================================================
 
 @app.get("/llm/sessions")
-async def llm_list_sessions():
-    """LLM 활성 세션 목록 조회"""
-    await ensure_llm_running()
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{LLM_SERVER_URL}/sessions")
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            return resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+async def llm_list_sessions(gpu: int | None = Query(default=None)):
+    """LLM 활성 세션 목록 조회 (gpu 미지정 시 전체 인스턴스 세션 합산)"""
+    if gpu is not None:
+        inst = await ensure_llm_running(gpu=gpu)
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{inst.url}/sessions")
+                return resp.json() if resp.status_code == 200 else []
+        except Exception:
+            return []
+    # 전체 인스턴스 세션 합산
+    all_sessions = []
+    for inst in llm_instances.values():
+        if inst.alive:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(f"{inst.url}/sessions")
+                    if resp.status_code == 200:
+                        sessions = resp.json()
+                        for s in (sessions if isinstance(sessions, list) else []):
+                            s["gpu_id"] = inst.gpu_id
+                        all_sessions.extend(sessions if isinstance(sessions, list) else [])
+            except Exception:
+                pass
+    return all_sessions
 
 
 @app.get("/llm/session/{session_id}")
-async def llm_get_session(session_id: str):
-    """LLM 세션 상세 조회 (대화 이력 포함)"""
-    await ensure_llm_running()
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(f"{LLM_SERVER_URL}/session/{session_id}")
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            return resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+async def llm_get_session(session_id: str, gpu: int | None = Query(default=None)):
+    """LLM 세션 상세 조회 (gpu 미지정 시 전체 인스턴스 검색)"""
+    targets = [llm_instances[gpu]] if gpu is not None and gpu in llm_instances else list(llm_instances.values())
+    for inst in targets:
+        if not inst.alive:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(f"{inst.url}/session/{session_id}")
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+    raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
 
 
 @app.delete("/llm/session/{session_id}")
-async def llm_delete_session(session_id: str):
+async def llm_delete_session(session_id: str, gpu: int | None = Query(default=None)):
     """LLM 세션 삭제"""
-    await ensure_llm_running()
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.delete(f"{LLM_SERVER_URL}/session/{session_id}")
-            if resp.status_code != 200:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            return resp.json()
-    except httpx.ConnectError:
-        raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+    targets = [llm_instances[gpu]] if gpu is not None and gpu in llm_instances else list(llm_instances.values())
+    for inst in targets:
+        if not inst.alive:
+            continue
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.delete(f"{inst.url}/session/{session_id}")
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            pass
+    raise HTTPException(status_code=404, detail="세션을 찾을 수 없습니다.")
 
 
 # ============================================================================
