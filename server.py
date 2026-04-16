@@ -1091,7 +1091,7 @@ async def get_usage_help():
     return {
         "service": "VrunGPU",
         "version": "0.6.0",
-        "description": "원격 GPU 학습/추론 실행 서버 + LLM Chat API",
+        "description": "원격 GPU 학습/추론 실행 서버 + Multi-GPU LLM Chat API",
 
         "llm_models": {
             "description": "지원되는 LLM 모델 목록",
@@ -1154,28 +1154,18 @@ async def get_usage_help():
 
         "api_examples": {
             "llm_chat": {
-                "description": "LLM 채팅 API (자동 서비스 시작)",
+                "description": "LLM 채팅 API (자동 서비스 시작, ?gpu=N으로 인스턴스 지정)",
                 "endpoint": "POST /llm/chat",
-                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/chat" \\
+                "curl_example": '''# 특정 GPU로 라우팅
+curl -X POST "http://{SERVER_IP}:9825/llm/chat?gpu=0" \\
   -H "Content-Type: application/json" \\
-  -d '{
-    "messages": [
-      {"role": "user", "content": "안녕하세요!"}
-    ],
-    "max_new_tokens": 512,
-    "temperature": 0.7
-  }' ''',
-                "python_example": '''import requests
+  -d '{"messages": [{"role": "user", "content": "안녕하세요!"}], "max_new_tokens": 512}'
 
-response = requests.post(
-    "http://{SERVER_IP}:9825/llm/chat",
-    json={
-        "messages": [{"role": "user", "content": "안녕하세요!"}],
-        "max_new_tokens": 512,
-        "temperature": 0.7
-    }
-)
-print(response.json())'''
+# gpu 생략 → 아무 실행 중인 인스턴스로 자동 라우팅
+curl -X POST "http://{SERVER_IP}:9825/llm/chat" \\
+  -H "Content-Type: application/json" \\
+  -d '{"messages": [{"role": "user", "content": "안녕하세요!"}], "max_new_tokens": 512}' ''',
+                "note": "gpu 파라미터 생략 시 실행 중인 아무 인스턴스로 자동 라우팅"
             },
 
             "llm_generate": {
@@ -1190,11 +1180,25 @@ print(response.json())'''
   }' '''
             },
 
-            "llm_start_gpt_oss": {
-                "description": "GPT-OSS-20B 모델 시작 (MXFP4 → CPU dequantize → BF16)",
+            "llm_multi_gpu": {
+                "description": "Multi-GPU LLM 동시 서빙 (GPU별 독립 인스턴스)",
                 "endpoint": "POST /llm/start",
-                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/llm/start?model=openai/gpt-oss-20b&gpu=1"''',
-                "note": "V100 등 compute < 7.5 GPU에서 CPU dequantization 자동 적용. gpu 파라미터로 GPU 지정 가능"
+                "curl_example": '''# GPU 0에 Qwen3.5-9B 시작
+curl -X POST "http://{SERVER_IP}:9825/llm/start?model=qwen3.5-9b&gpu=0"
+
+# GPU 1에 Qwen2.5-7B 동시 시작 (port 9827)
+curl -X POST "http://{SERVER_IP}:9825/llm/start?model=qwen2.5-7b&gpu=1"
+
+# 동일 모델 양쪽 GPU에도 가능 (throughput 2배)
+# curl -X POST "http://{SERVER_IP}:9825/llm/start?model=qwen2.5-7b&gpu=0"
+# curl -X POST "http://{SERVER_IP}:9825/llm/start?model=qwen2.5-7b&gpu=1"
+
+# GPU 0만 중지 (GPU 1은 유지)
+curl -X POST "http://{SERVER_IP}:9825/llm/stop?gpu=0"
+
+# 전체 상태 확인
+curl "http://{SERVER_IP}:9825/llm/status"''',
+                "note": "포트 = 9826 + gpu_id. 각 인스턴스는 독립 프로세스. /llm/chat?gpu=N 으로 특정 인스턴스 호출, 생략 시 아무 인스턴스"
             },
 
             "finetune": {
@@ -1310,13 +1314,13 @@ print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special
         },
 
         "endpoints_summary": {
-            "LLM API": [
-                "POST /llm/start - LLM 서비스 시작 (model, gpu, lora_adapter, load_in_4bit 파라미터)",
-                "POST /llm/stop - LLM 서비스 중지 (GPU 자동 반환)",
-                "GET  /llm/status - LLM 서비스 상태 확인 (비정상 종료 시 GPU 자동 회수)",
-                "POST /llm/chat - 채팅 API (자동 서비스 시작, session_id로 멀티턴 지원)",
-                "POST /llm/generate - 텍스트 생성 API (자동 서비스 시작)",
-                "GET  /llm/sessions - 활성 세션 목록",
+            "LLM API (Multi-GPU)": [
+                "POST /llm/start?model=...&gpu=N - GPU별 독립 LLM 인스턴스 시작 (port=9826+N)",
+                "POST /llm/stop?gpu=N - 특정 GPU 중지 (생략 시 전체 중지)",
+                "GET  /llm/status - 전체 인스턴스 상태 (per-GPU model, port, health)",
+                "POST /llm/chat?gpu=N - 채팅 (gpu 생략 시 아무 인스턴스, session_id 멀티턴)",
+                "POST /llm/generate?gpu=N - 텍스트 생성 (gpu 생략 시 아무 인스턴스)",
+                "GET  /llm/sessions?gpu=N - 활성 세션 목록 (생략 시 전체 합산)",
                 "GET  /llm/session/{id} - 세션 대화 이력 조회",
                 "DELETE /llm/session/{id} - 세션 삭제"
             ],
@@ -1364,14 +1368,14 @@ print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special
         },
 
         "notes": [
-            "기본 모델: Qwen3.5-9B (model 파라미터 없이 /llm/chat 호출 시 자동 시작)",
-            "모델 alias 지원: qwen3.5-9b, qwen2.5-vl-7b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b 등",
-            "Vision-Language: qwen2.5-vl-7b는 이미지/비디오 입력 지원. /llm/chat 미지원, /run/async로 직접 사용 (api_examples.vision_language 참조)",
-            "GPU 2개 환경: LLM과 Training/Fine-tuning이 각각 다른 GPU에서 동시 실행 가능",
-            "LLM/파인튜닝 시작 시 gpu_pool에서 GPU를 예약하며, 종료 시 자동 반환됩니다.",
-            "파인튜닝: PEFT fp16 LoRA 방식 (QLoRA 4-bit 미사용). V100 호환.",
-            "파인튜닝 데이터셋 JSONL 포맷: messages, instruction/output, text 자동 감지",
+            "Multi-GPU LLM: GPU별 독립 인스턴스 (port=9826+gpu_id). 동일/다른 모델 동시 서빙 가능",
+            "기본 모델: Qwen3.5-9B (model 파라미터 없이 /llm/chat 호출 시 GPU 0에서 자동 시작)",
+            "모델 alias: qwen3.5-9b, qwen2.5-7b, qwen2.5-vl-7b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b 등",
+            "?gpu=N 파라미터: /llm/chat, /llm/generate, /llm/stop, /llm/sessions에서 인스턴스 지정. 생략 시 자동 라우팅",
+            "Vision-Language: qwen2.5-vl-7b는 /llm/chat 미지원, /run/async로 직접 사용 (api_examples.vision_language 참조)",
+            "파인튜닝: SFT (/llm/finetune) + DPO (/llm/finetune/dpo). PEFT fp16 LoRA, V100 호환",
             "파인튜닝 완료 후 lora_adapter 파라미터로 /llm/start에서 바로 사용 가능",
+            "파일 업로드: POST /upload로 데이터셋 등 업로드, 반환 path를 finetune 등에서 직접 사용",
             "/llm/chat에 session_id로 멀티턴 대화 세션 지원 (TTL 4시간)",
             "V100S 32GB x2 GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",

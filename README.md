@@ -325,7 +325,7 @@ curl http://your-server:9825/task/{task_id}
 
 ## LLM Chat API
 
-Built-in LLM inference service with automatic GPU management. Supports Qwen2.5 and Qwen3 models.
+Built-in LLM inference service with **multi-GPU support**. Run different (or same) models on each GPU simultaneously. Supports Qwen2.5/Qwen3/Qwen3.5, Vision-Language, DeepSeek, GPT-OSS models.
 
 ### Supported Models
 
@@ -344,61 +344,82 @@ Model aliases (short names) are accepted wherever a model name is expected.
 
 ### Start LLM Service
 
+Each GPU runs an independent inference server (port = 9826 + gpu_id). You can run different or the same models on multiple GPUs simultaneously.
+
 ```bash
-# Start with specific model
-curl -X POST "http://your-server:9825/llm/start?model=Qwen/Qwen2.5-7B-Instruct&gpu=0"
+# Start model on GPU 0 (port 9826)
+curl -X POST "http://your-server:9825/llm/start?model=qwen3.5-9b&gpu=0"
 
-# Start DeepSeek-R1-14B (V100 32GB 권장)
-curl -X POST "http://your-server:9825/llm/start?model=deepseek-ai/DeepSeek-R1-Distill-Qwen-14B&gpu=0"
+# Start a different model on GPU 1 (port 9827) — runs simultaneously
+curl -X POST "http://your-server:9825/llm/start?model=qwen2.5-7b&gpu=1"
 
-# Start GPT-OSS-20B (V100 32GB+ 권장)
-curl -X POST "http://your-server:9825/llm/start?model=openai/gpt-oss-20b&gpu=0"
+# Or same model on both GPUs for higher throughput
+curl -X POST "http://your-server:9825/llm/start?model=qwen2.5-7b&gpu=0"
+curl -X POST "http://your-server:9825/llm/start?model=qwen2.5-7b&gpu=1"
 ```
 
 ### Chat API
 
 ```bash
+# Route to specific GPU
+curl -X POST "http://your-server:9825/llm/chat?gpu=0" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_new_tokens": 256,
+    "temperature": 0.7
+  }'
+
+# Omit gpu → routes to any running instance
 curl -X POST http://your-server:9825/llm/chat \
   -H "Content-Type: application/json" \
   -d '{
-    "messages": [
-      {"role": "user", "content": "Hello, how are you?"}
-    ],
-    "max_new_tokens": 256,
-    "temperature": 0.7
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_new_tokens": 256
   }'
 ```
 
 ### Text Generation API
 
 ```bash
-curl -X POST http://your-server:9825/llm/generate \
+# Route to GPU 1 specifically
+curl -X POST "http://your-server:9825/llm/generate?gpu=1" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "Write a Python quicksort function",
-    "max_new_tokens": 512,
-    "temperature": 0.7
+    "max_new_tokens": 512
   }'
 ```
 
 ### LLM Service Management
 
 ```bash
-# Check status
+# Check all instances
 curl http://your-server:9825/llm/status
+# Returns: instances[] with per-GPU model, port, pid, running status
 
-# Stop service (free GPU memory)
+# Stop specific GPU only
+curl -X POST "http://your-server:9825/llm/stop?gpu=0"
+
+# Stop all instances
 curl -X POST http://your-server:9825/llm/stop
 ```
 
-### Auto GPU Switching
+### Multi-GPU Architecture
 
-VrunGPU automatically manages GPU resources between LLM and training:
+```
+Client Request              VrunGPU Server (port 9825)
+     │                              │
+     ├─ /llm/chat?gpu=0 ──────────►├──► inference_server (GPU 0, port 9826)
+     │                              │
+     ├─ /llm/chat?gpu=1 ──────────►├──► inference_server (GPU 1, port 9827)
+     │                              │
+     └─ /llm/chat (no gpu) ───────►├──► any running instance (auto-select)
+```
 
-- **Training job submitted** → LLM service automatically stops
-- **LLM API called** → LLM service automatically starts (if not running)
-
-This allows seamless sharing of a single GPU between training and LLM inference.
+- **Independent instances**: Each GPU loads its own model, has its own sessions
+- **Auto GPU switching**: Training jobs still trigger LLM auto-stop per GPU
+- **Selective stop**: Free one GPU for training while keeping the other serving
 
 ### Python Example
 
@@ -407,26 +428,34 @@ import requests
 
 SERVER = "http://your-server:9825"
 
-# Start LLM with specific model
-requests.post(f"{SERVER}/llm/start", params={
-    "model": "Qwen/Qwen2.5-7B-Instruct",
-    "gpu": 0
-})
+# Start models on both GPUs
+requests.post(f"{SERVER}/llm/start", params={"model": "qwen3.5-9b", "gpu": 0})
+requests.post(f"{SERVER}/llm/start", params={"model": "qwen2.5-7b", "gpu": 1})
 
-# Or start GPT-OSS-20B (V100 32GB+ recommended)
-requests.post(f"{SERVER}/llm/start", params={
-    "model": "openai/gpt-oss-20b",
-    "gpu": 0
-})
-
-# Chat
-response = requests.post(f"{SERVER}/llm/chat", json={
+# Chat with GPU 0 (Qwen3.5-9B)
+r0 = requests.post(f"{SERVER}/llm/chat", params={"gpu": 0}, json={
     "messages": [{"role": "user", "content": "Explain machine learning"}],
     "max_new_tokens": 512
 })
-print(response.json()["generated_text"])
+print("GPU0:", r0.json()["generated_text"])
 
-# Stop when done
+# Chat with GPU 1 (Qwen2.5-7B)
+r1 = requests.post(f"{SERVER}/llm/chat", params={"gpu": 1}, json={
+    "messages": [{"role": "user", "content": "Explain machine learning"}],
+    "max_new_tokens": 512
+})
+print("GPU1:", r1.json()["generated_text"])
+
+# Stop GPU 0, keep GPU 1 running
+requests.post(f"{SERVER}/llm/stop", params={"gpu": 0})
+
+# Chat without gpu param → routes to GPU 1 (only running instance)
+r = requests.post(f"{SERVER}/llm/chat", json={
+    "messages": [{"role": "user", "content": "Hello"}]
+})
+print(r.json()["generated_text"])
+
+# Stop all
 requests.post(f"{SERVER}/llm/stop")
 ```
 
@@ -754,14 +783,16 @@ print(f"Task started: {task_id}")
 
 ### LLM Service Endpoints
 
+All LLM endpoints accept an optional `?gpu=N` parameter to target a specific GPU instance.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/llm/start` | POST | Start LLM service (params: model, gpu, lora_adapter) |
-| `/llm/stop` | POST | Stop LLM service |
-| `/llm/status` | GET | Get LLM service status |
-| `/llm/generate` | POST | Text generation (auto-starts LLM) |
-| `/llm/chat` | POST | Chat completion (auto-starts LLM, session_id supported) |
-| `/llm/sessions` | GET | List active chat sessions |
+| `/llm/start` | POST | Start LLM instance on GPU (params: model, gpu, lora_adapter) |
+| `/llm/stop` | POST | Stop instance (?gpu=N for specific, omit for all) |
+| `/llm/status` | GET | All instances status (per-GPU model, port, health) |
+| `/llm/generate` | POST | Text generation (?gpu=N or auto-route) |
+| `/llm/chat` | POST | Chat completion (?gpu=N or auto-route, session_id) |
+| `/llm/sessions` | GET | List active chat sessions (all instances or ?gpu=N) |
 | `/llm/session/{id}` | GET | Get session history |
 | `/llm/session/{id}` | DELETE | Delete session |
 
@@ -875,27 +906,28 @@ vrungpu/
 
 ```
 vrungpu/
-├── server.py           # FastAPI server (main)
-├── inference_server.py # LLM inference server (Qwen2.5/Qwen3)
-├── client.py           # Python client
-├── requirements.txt    # Dependencies
-├── test_server.py      # Test script
-├── README.md           # Documentation
-├── data/               # Persistent storage
-│   ├── vrungpu.db      # SQLite database
-│   ├── workspaces/     # Task workspaces
-│   ├── models/         # Registered models
-│   └── uploads/        # Upload files
-├── dashboard/          # Next.js dashboard
+├── server.py              # FastAPI server (main, multi-GPU LLM management)
+├── inference_server.py    # LLM inference server (per-GPU instance)
+├── finetune_worker.py     # SFT LoRA fine-tuning worker
+├── finetune_dpo_worker.py # DPO fine-tuning worker (TRL DPOTrainer)
+├── client.py              # Python client
+├── requirements.txt       # Dependencies
+├── test_server.py         # Test script
+├── README.md              # Documentation
+├── data/                  # Persistent storage
+│   ├── vrungpu.db         # SQLite database
+│   ├── workspaces/        # Task workspaces
+│   ├── models/            # Registered + fine-tuned models
+│   │   └── finetune/      # LoRA adapter outputs
+│   ├── uploads/           # Uploaded files (datasets, etc.)
+│   └── logs/              # Per-GPU inference server logs
+├── dashboard/             # Next.js dashboard
 │   ├── app/
-│   │   ├── page.tsx    # Dashboard UI (D3.js charts)
-│   │   └── globals.css # Animation styles
+│   │   ├── page.tsx       # Dashboard UI (D3.js charts)
+│   │   └── globals.css    # Animation styles
 │   └── package.json
-└── examples/           # Example projects
+└── examples/              # Example projects
     └── mnist_project/
-        ├── train.py
-        ├── model.py
-        └── utils.py
 ```
 
 ---
@@ -1000,7 +1032,7 @@ Response:
 
 ## Version History
 
-- **v0.6.0** - File Upload API, DPO fine-tuning (TRL DPOTrainer + LoRA), fix for asyncio `LimitOverrunError` ("Separator is not found") on large subprocess output / tqdm progress bars
+- **v0.6.0** - Multi-GPU LLM (GPU별 독립 인스턴스, 동시 서빙), File Upload API, DPO fine-tuning (TRL DPOTrainer + LoRA), fix asyncio LimitOverrunError on large subprocess output
 - **v0.5.0** - LLM Chat API (Qwen2.5/Qwen3/Qwen3.5, Qwen2.5-VL), SFT LoRA fine-tuning, server-side chat sessions, model aliases, auto GPU switching
 - **v0.4.0** - SQLite persistence, model management API, inference API, progress tracking
 - **v0.3.0** - D3.js dashboard with smooth animations
