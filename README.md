@@ -747,8 +747,76 @@ print(f"Task started: {task_id}")
 | `/run/project` | POST | Upload ZIP/file and execute |
 | `/task/{task_id}` | GET | Get task status/result/progress |
 | `/tasks` | GET | List tasks |
-| `/task/{task_id}` | DELETE | Delete task |
+| `/task/{task_id}` | DELETE | Delete task record + workspace (⚠ does NOT kill process — cancel first) |
 | `/task/{task_id}/progress` | PUT | Manual progress update |
+
+### Task Management Endpoints (v0.7.0)
+
+Live observability and control over in-flight tasks — cancel a stuck training run, tail logs, browse workspace files, or subscribe to live stdout via SSE.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/task/{task_id}/cancel` | POST | Cancel running task: SIGTERM → (timeout) → SIGKILL. Releases GPU. `?timeout=5` (default 5s) |
+| `/task/{task_id}/logs` | GET | Tail logs. `?source=stdout\|stderr\|all\|workspace` · `?tail=200` · running uses 1000-line ring buffer, completed uses `task.stdout/stderr` |
+| `/task/{task_id}/logs/stream` | GET | **SSE** live log stream. Pushes 200-line snapshot, then real-time lines. Emits `event: end` on task completion |
+| `/task/{task_id}/files` | GET | Workspace file tree. `?max_depth=3` (default). Returns path/type/size_bytes/mtime |
+| `/task/{task_id}/files/{path}` | GET | Read individual file from workspace. `?tail=N` for text tail, otherwise full file download |
+
+**Why it matters** — many frameworks (RecBole, TensorFlow, etc.) write logs to their own files instead of stdout, leaving `task.stdout` empty. `GET /task/{id}/logs?source=workspace` scans `work_dir/**/*.log` and tails the most recently modified file, so you can see epoch/loss progress even for file-logger frameworks.
+
+**Example — tail RecBole training log**:
+
+```bash
+# Show most recent log file (auto-detected)
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/logs?source=workspace&tail=50"
+
+# Target specific file
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/logs?source=workspace&workspace_file=log/LightGCN/train.log&tail=20"
+```
+
+**Example — Python SSE client (live tail -f)**:
+
+```python
+import httpx
+
+url = f"http://{SERVER_IP}:9825/task/{TASK_ID}/logs/stream"
+with httpx.stream("GET", url, timeout=None) as r:
+    for line in r.iter_lines():
+        if line.startswith("data: "):
+            import json
+            evt = json.loads(line[6:])
+            print(f"[{evt['stream']}] {evt['line']}", end="")
+        elif line.startswith("event: end"):
+            print("\n--- task finished ---")
+            break
+```
+
+**Example — cancel a stuck task**:
+
+```bash
+# Default 5-second SIGTERM grace period, then SIGKILL
+curl -X POST "http://{SERVER_IP}:9825/task/{TASK_ID}/cancel"
+
+# Give the task 30 seconds to flush checkpoints before force-kill
+curl -X POST "http://{SERVER_IP}:9825/task/{TASK_ID}/cancel?timeout=30"
+```
+
+The GPU is automatically returned to the pool on cancel. Status transitions from `running` → `cancelled` (preserved — not overridden to `failed`).
+
+**Example — browse workspace for debugging**:
+
+```bash
+# List all files within workspace, depth 3
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files?max_depth=3"
+
+# Download a config file
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/config.yaml" -o config.yaml
+
+# Peek at last 30 lines of any text file
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/saved/LightGCN-Mar-30-2026.pth.txt?tail=30"
+```
+
+Path traversal (`..`) is blocked — requests resolving outside the workspace return 400.
 
 ### File Upload Endpoints
 
@@ -1032,6 +1100,7 @@ Response:
 
 ## Version History
 
+- **v0.7.0** - Task Management API: `POST /task/{id}/cancel` (SIGTERM→SIGKILL, GPU auto-release), `GET /task/{id}/logs?source=stdout|stderr|all|workspace` (ring-buffer tail for running tasks, file-based tail for frameworks like RecBole that bypass stdout), `GET /task/{id}/logs/stream` (SSE live tail), `GET /task/{id}/files` + `/files/{path}` (workspace browsing with path-traversal protection). Preserves `cancelled` status instead of overwriting with `failed`.
 - **v0.6.0** - Multi-GPU LLM (GPU별 독립 인스턴스, 동시 서빙), File Upload API, DPO fine-tuning (TRL DPOTrainer + LoRA), fix asyncio LimitOverrunError on large subprocess output
 - **v0.5.0** - LLM Chat API (Qwen2.5/Qwen3/Qwen3.5, Qwen2.5-VL), SFT LoRA fine-tuning, server-side chat sessions, model aliases, auto GPU switching
 - **v0.4.0** - SQLite persistence, model management API, inference API, progress tracking

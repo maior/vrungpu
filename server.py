@@ -22,6 +22,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
@@ -32,7 +33,7 @@ import aiofiles
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 
@@ -559,6 +560,40 @@ gpu_pool = GPUPool()
 websocket_clients: set[WebSocket] = set()
 running_tasks: dict[str, TaskResult] = {}  # 메모리 캐시 (실행 중인 작업만)
 
+# Task Management - 실시간 조작/관측용 사이드 채널
+# task_id → asyncio.subprocess.Process (/run/async, /run/project 서브프로세스)
+task_processes: dict[str, asyncio.subprocess.Process] = {}
+# task_id → recent stdout/stderr 라인 ring buffer (실행 중에만 존재)
+TASK_LOG_BUFFER_MAX = 1000
+task_log_buffers: dict[str, deque] = {}
+# task_id → SSE subscriber queues (라인 푸시 타겟)
+task_log_subscribers: dict[str, list[asyncio.Queue]] = {}
+
+
+def _push_log_line(task_id: str, stream_name: str, line: str):
+    """실행 중인 task의 ring buffer + SSE 구독자에게 로그 라인 전달"""
+    buf = task_log_buffers.get(task_id)
+    if buf is not None:
+        buf.append((stream_name, line))
+    subs = task_log_subscribers.get(task_id)
+    if subs:
+        for q in list(subs):
+            try:
+                q.put_nowait((stream_name, line))
+            except asyncio.QueueFull:
+                pass  # 느린 구독자는 드롭
+
+
+def _safe_workspace_path(work_dir: Path, relative: str) -> Path:
+    """workspace 하위 경로만 허용 (디렉터리 탈출 방지)"""
+    candidate = (work_dir / relative).resolve()
+    work_root = work_dir.resolve()
+    try:
+        candidate.relative_to(work_root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="workspace 외부 경로는 허용되지 않습니다.")
+    return candidate
+
 # LLM Inference Server — Multi-GPU 지원
 # GPU별로 독립 인스턴스 운영, 포트 = LLM_BASE_PORT + gpu_id
 LLM_BASE_PORT = LLM_SERVER_PORT  # 9826
@@ -722,7 +757,7 @@ init_database()
 app = FastAPI(
     title="VrunGPU",
     description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리 + LLM Chat)",
-    version="0.6.0",
+    version="0.7.0",
 )
 
 app.add_middleware(
@@ -880,6 +915,8 @@ async def run_task_with_streaming(
             cwd=str(work_dir),
             env=env,
         )
+        task_processes[task_id] = process
+        task_log_buffers[task_id] = deque(maxlen=TASK_LOG_BUFFER_MAX)
 
         async def read_stream(stream, lines, stream_name):
             # 청크 기반 읽기: readline()의 LimitOverrunError(64KB) 회피.
@@ -901,6 +938,7 @@ async def run_task_with_streaming(
                         save_task(task)
                     except Exception:
                         pass
+                _push_log_line(task_id, stream_name, decoded)
                 await broadcast({
                     "type": "task_output",
                     "task_id": task_id,
@@ -955,7 +993,9 @@ async def run_task_with_streaming(
         task.stdout = "".join(stdout_lines)
         task.stderr = "".join(stderr_lines)
         task.return_code = return_code
-        task.status = TaskStatus.COMPLETED if return_code == 0 else TaskStatus.FAILED
+        # cancel 엔드포인트가 먼저 CANCELLED로 마킹한 경우 보존
+        if task.status != TaskStatus.CANCELLED:
+            task.status = TaskStatus.COMPLETED if return_code == 0 else TaskStatus.FAILED
         task.progress = 100 if return_code == 0 else task.progress
 
         # 모델 저장 처리
@@ -970,6 +1010,14 @@ async def run_task_with_streaming(
         save_task(task)
         gpu_pool.release(assigned_gpu)
         running_tasks.pop(task_id, None)
+        task_processes.pop(task_id, None)
+        task_log_buffers.pop(task_id, None)
+        # SSE 구독자들에게 종료 신호 (None sentinel)
+        for q in task_log_subscribers.pop(task_id, []) or []:
+            try:
+                q.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
         await broadcast_task_update(task)
         await broadcast_gpu_update()
 
@@ -1072,7 +1120,7 @@ async def root():
     return {
         "service": "VrunGPU",
         "status": "running",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "gpu_count": pool_status["total_gpus"],
         "available_gpus": len(pool_status["available_gpus"]),
         "total_tasks": total_tasks,
@@ -1090,7 +1138,7 @@ async def get_usage_help():
     """VrunGPU 사용방법 문서 (원격 조회 가능)"""
     return {
         "service": "VrunGPU",
-        "version": "0.6.0",
+        "version": "0.7.0",
         "description": "원격 GPU 학습/추론 실행 서버 + Multi-GPU LLM Chat API",
 
         "llm_models": {
@@ -1310,6 +1358,58 @@ print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special
                 "description": "작업 상태 확인",
                 "endpoint": "GET /task/{task_id}",
                 "curl_example": '''curl "http://{SERVER_IP}:9825/task/{TASK_ID}"'''
+            },
+
+            "task_logs": {
+                "description": "task 로그 tail (실행 중/완료 모두). source=workspace면 RecBole처럼 자체 로그 파일 쓰는 task도 조회 가능",
+                "endpoint": "GET /task/{task_id}/logs",
+                "curl_example": '''# 실시간 stdout 마지막 200줄
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/logs?source=stdout&tail=200"
+
+# workspace 디렉터리 내 최신 *.log 파일 tail (RecBole 등)
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/logs?source=workspace&tail=100"
+
+# 특정 workspace 파일 지정
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/logs?source=workspace&workspace_file=log/LightGCN/train.log&tail=100"''',
+                "note": "running 중이면 1000줄 ring buffer, 완료되면 task.stdout/stderr 전체"
+            },
+
+            "task_logs_stream": {
+                "description": "실시간 로그 SSE 스트림 (tail -f 유사). EventSource로 수신",
+                "endpoint": "GET /task/{task_id}/logs/stream",
+                "curl_example": '''curl -N "http://{SERVER_IP}:9825/task/{TASK_ID}/logs/stream"''',
+                "python_example": '''import httpx
+with httpx.stream("GET", f"http://{SERVER_IP}:9825/task/{TASK_ID}/logs/stream", timeout=None) as r:
+    for line in r.iter_lines():
+        if line.startswith("data: "):
+            print(line[6:])
+        elif line.startswith("event: end"):
+            break''',
+                "note": "최근 200줄 snapshot 선 푸시 후 실시간 라인 전송. task 종료 시 event: end 수신"
+            },
+
+            "task_cancel": {
+                "description": "실행 중 task 취소 (SIGTERM → 5초 후 SIGKILL). GPU 자동 해제",
+                "endpoint": "POST /task/{task_id}/cancel",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/task/{TASK_ID}/cancel"
+
+# 타임아웃 커스터마이즈 (기본 5초)
+curl -X POST "http://{SERVER_IP}:9825/task/{TASK_ID}/cancel?timeout=10"''',
+                "note": "DELETE /task/{id}는 프로세스를 안 죽이므로 먼저 cancel 필요"
+            },
+
+            "task_files": {
+                "description": "workspace 디렉터리 파일 브라우징 (config, 체크포인트, 로그 등 디버깅)",
+                "endpoint": "GET /task/{task_id}/files",
+                "curl_example": '''# 파일 트리
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files?max_depth=3"
+
+# 개별 파일 다운로드
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/config.yaml" -o config.yaml
+
+# 로그 파일 마지막 50줄
+curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/log/LightGCN/train.log?tail=50"''',
+                "note": "경로 탈출 차단. 디렉터리는 files/{path} 대신 files 사용"
             }
         },
 
@@ -1343,7 +1443,17 @@ print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special
                 "POST /run/async - 비동기 실행 (즉시 반환)",
                 "POST /run/project - 프로젝트 ZIP 업로드 후 실행",
                 "GET  /task/{task_id} - 작업 상태 조회",
-                "GET  /tasks - 작업 목록 조회"
+                "GET  /tasks - 작업 목록 조회",
+                "PUT  /task/{task_id}/progress - 진행률 외부 업데이트"
+            ],
+            "Task Management API (v0.7.0)": [
+                "POST /task/{task_id}/cancel?timeout=5 - 실행 중인 task 취소 (SIGTERM → SIGKILL)",
+                "GET  /task/{task_id}/logs?source=all&tail=200 - 로그 tail (stdout|stderr|all|workspace)",
+                "GET  /task/{task_id}/logs?source=workspace&tail=200 - workspace 내 *.log 파일 tail (RecBole 등 파일 로거 지원)",
+                "GET  /task/{task_id}/logs/stream - 실시간 로그 SSE 스트림",
+                "GET  /task/{task_id}/files?max_depth=3 - workspace 디렉터리 파일 트리",
+                "GET  /task/{task_id}/files/{path} - workspace 내 개별 파일 읽기 (tail=N 옵션)",
+                "DELETE /task/{task_id} - DB 레코드 + workspace 삭제 (프로세스는 안 죽이니 cancel 먼저)"
             ],
             "Model API": [
                 "GET  /models - 모델 목록 조회",
@@ -1376,6 +1486,8 @@ print(processor.batch_decode(output[:, inputs.input_ids.shape[1]:], skip_special
             "파인튜닝: SFT (/llm/finetune) + DPO (/llm/finetune/dpo). PEFT fp16 LoRA, V100 호환",
             "파인튜닝 완료 후 lora_adapter 파라미터로 /llm/start에서 바로 사용 가능",
             "파일 업로드: POST /upload로 데이터셋 등 업로드, 반환 path를 finetune 등에서 직접 사용",
+            "Task 관측/제어: /task/{id}/logs (tail), /task/{id}/logs/stream (SSE), /task/{id}/files (파일 트리), /task/{id}/cancel (안전 종료)",
+            "RecBole 등 자체 로그 파일 쓰는 프레임워크는 ?source=workspace 로 진행 상황 조회 가능 (stdout 비어있어도 OK)",
             "/llm/chat에 session_id로 멀티턴 대화 세션 지원 (TTL 4시간)",
             "V100S 32GB x2 GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",
@@ -1742,6 +1854,272 @@ async def update_task_progress(task_id: str, update: ProgressUpdate):
     await broadcast_task_update(task)
 
     return {"message": "Progress updated", "progress": update.progress}
+
+
+@app.post("/task/{task_id}/cancel")
+async def cancel_task(task_id: str, timeout: float = Query(default=5.0, ge=0.5, le=60.0)):
+    """실행 중인 task를 취소. SIGTERM → timeout 후 살아있으면 SIGKILL."""
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if task.status not in (TaskStatus.RUNNING, TaskStatus.QUEUED, TaskStatus.PENDING):
+        return {
+            "message": f"이미 {task.status.value} 상태인 작업입니다.",
+            "task_id": task_id,
+            "status": task.status.value,
+        }
+
+    process = task_processes.get(task_id)
+    if process is None or process.returncode is not None:
+        # 프로세스 핸들 없음 (queued 상태 등) → 상태만 cancelled로 마킹
+        task.status = TaskStatus.CANCELLED
+        task.completed_at = datetime.now()
+        save_task(task)
+        running_tasks.pop(task_id, None)
+        await broadcast_task_update(task)
+        return {"message": "프로세스가 실행 중이 아니라 상태만 cancelled로 기록했습니다.", "task_id": task_id}
+
+    signal_used = "SIGTERM"
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        pass
+
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        signal_used = "SIGKILL"
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=500, detail="프로세스 종료에 실패했습니다.")
+
+    # run_task_with_streaming의 finally가 곧 정리하지만, 최종 상태는 명시적으로 cancelled로 마킹
+    task.status = TaskStatus.CANCELLED
+    task.return_code = process.returncode
+    save_task(task)
+    await broadcast_task_update(task)
+
+    return {
+        "message": "작업이 취소되었습니다.",
+        "task_id": task_id,
+        "signal": signal_used,
+        "return_code": process.returncode,
+    }
+
+
+@app.get("/task/{task_id}/logs")
+async def get_task_logs(
+    task_id: str,
+    tail: int = Query(default=200, ge=1, le=10000, description="최근 N줄"),
+    source: str = Query(default="all", description="stdout|stderr|all|workspace"),
+    workspace_file: str | None = Query(default=None, description="workspace 내 특정 로그 파일 상대경로 (source=workspace일 때)"),
+):
+    """작업 로그 tail. 실행 중이면 ring buffer, 완료되면 task.stdout/stderr, source=workspace면 work_dir 내 *.log tail."""
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+
+    if source == "workspace":
+        if not task.work_dir:
+            raise HTTPException(status_code=400, detail="workspace가 없는 작업입니다.")
+        work_dir = Path(task.work_dir)
+        if not work_dir.exists():
+            raise HTTPException(status_code=404, detail="workspace 디렉터리가 존재하지 않습니다.")
+
+        if workspace_file:
+            target = _safe_workspace_path(work_dir, workspace_file)
+            if not target.is_file():
+                raise HTTPException(status_code=404, detail=f"파일을 찾을 수 없습니다: {workspace_file}")
+            log_files = [target]
+        else:
+            # 워크스페이스 내 모든 *.log 파일을 mtime 내림차순 (가장 최신 로그 우선)
+            log_files = sorted(
+                work_dir.rglob("*.log"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not log_files:
+                raise HTTPException(status_code=404, detail="workspace에 *.log 파일이 없습니다.")
+
+        newest = log_files[0]
+        # 파일 tail: 간단히 전체 읽고 마지막 N줄 (대규모 파일 대비하여 128KB 이내로 제한)
+        try:
+            size = newest.stat().st_size
+            with open(newest, "rb") as f:
+                if size > 1024 * 1024:  # 1MB 초과 시 꼬리 256KB만 읽음
+                    f.seek(-256 * 1024, os.SEEK_END)
+                    f.readline()  # 부분 라인 스킵
+                content_bytes = f.read()
+            content = content_bytes.decode("utf-8", errors="replace")
+            lines_all = content.splitlines()
+            tail_lines = lines_all[-tail:]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"로그 파일 읽기 실패: {e}")
+
+        return {
+            "task_id": task_id,
+            "source": "workspace",
+            "file": str(newest.relative_to(work_dir)),
+            "available_log_files": [str(p.relative_to(work_dir)) for p in log_files[:20]],
+            "lines": tail_lines,
+            "truncated": size > 1024 * 1024,
+            "file_size_bytes": size,
+        }
+
+    # source ∈ {stdout, stderr, all}
+    buf = task_log_buffers.get(task_id)
+    if buf is not None:
+        # 실행 중 - ring buffer에서 필터
+        if source == "stdout":
+            filtered = [l for (s, l) in buf if s == "stdout"]
+        elif source == "stderr":
+            filtered = [l for (s, l) in buf if s == "stderr"]
+        elif source == "all":
+            filtered = [l for (s, l) in buf]
+        else:
+            raise HTTPException(status_code=400, detail="source는 stdout|stderr|all|workspace 중 하나")
+        tail_lines = filtered[-tail:]
+        return {
+            "task_id": task_id,
+            "source": source,
+            "status": task.status,
+            "lines": tail_lines,
+            "buffered": True,
+            "buffer_max": TASK_LOG_BUFFER_MAX,
+        }
+
+    # 완료된 task - task.stdout/stderr에서 tail
+    if source == "stdout":
+        text = task.stdout or ""
+    elif source == "stderr":
+        text = task.stderr or ""
+    elif source == "all":
+        text = (task.stdout or "") + (task.stderr or "")
+    else:
+        raise HTTPException(status_code=400, detail="source는 stdout|stderr|all|workspace 중 하나")
+    all_lines = text.splitlines()
+    return {
+        "task_id": task_id,
+        "source": source,
+        "status": task.status,
+        "lines": all_lines[-tail:],
+        "buffered": False,
+    }
+
+
+@app.get("/task/{task_id}/logs/stream")
+async def stream_task_logs(task_id: str):
+    """실시간 로그 SSE 스트림. 종료 시 자동 close."""
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if task_id not in task_processes:
+        raise HTTPException(status_code=409, detail="실행 중이 아닌 작업은 stream할 수 없습니다. GET /task/{id}/logs 사용")
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=2000)
+    task_log_subscribers.setdefault(task_id, []).append(queue)
+
+    # 기존 버퍼 snapshot을 먼저 푸시 (최근 200줄)
+    snapshot = list(task_log_buffers.get(task_id, []))[-200:]
+
+    async def event_gen():
+        try:
+            for stream_name, line in snapshot:
+                payload = json.dumps({"stream": stream_name, "line": line}, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+            while True:
+                item = await queue.get()
+                if item is None:  # 종료 sentinel
+                    yield "event: end\ndata: {}\n\n"
+                    break
+                stream_name, line = item
+                payload = json.dumps({"stream": stream_name, "line": line}, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+        finally:
+            subs = task_log_subscribers.get(task_id)
+            if subs and queue in subs:
+                subs.remove(queue)
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@app.get("/task/{task_id}/files")
+async def list_task_files(task_id: str, max_depth: int = Query(default=3, ge=1, le=6)):
+    """workspace 디렉터리 파일 트리 조회 (깊이 제한)"""
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if not task.work_dir:
+        raise HTTPException(status_code=400, detail="workspace가 없는 작업입니다.")
+    work_dir = Path(task.work_dir)
+    if not work_dir.exists():
+        raise HTTPException(status_code=404, detail="workspace 디렉터리가 존재하지 않습니다.")
+
+    work_root = work_dir.resolve()
+    entries = []
+    for p in work_dir.rglob("*"):
+        try:
+            rel = p.resolve().relative_to(work_root)
+        except ValueError:
+            continue
+        depth = len(rel.parts)
+        if depth > max_depth:
+            continue
+        try:
+            st = p.stat()
+        except FileNotFoundError:
+            continue
+        entries.append({
+            "path": str(rel),
+            "type": "dir" if p.is_dir() else "file",
+            "size_bytes": 0 if p.is_dir() else st.st_size,
+            "mtime": datetime.fromtimestamp(st.st_mtime).isoformat(),
+        })
+    entries.sort(key=lambda e: e["path"])
+    return {
+        "task_id": task_id,
+        "work_dir": str(work_dir),
+        "max_depth": max_depth,
+        "entries": entries,
+        "count": len(entries),
+    }
+
+
+@app.get("/task/{task_id}/files/{file_path:path}")
+async def get_task_file(task_id: str, file_path: str, tail: int | None = Query(default=None, ge=1, le=100000)):
+    """workspace 내 특정 파일 읽기. tail 지정 시 마지막 N줄만 반환."""
+    task = running_tasks.get(task_id) or get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="작업을 찾을 수 없습니다.")
+    if not task.work_dir:
+        raise HTTPException(status_code=400, detail="workspace가 없는 작업입니다.")
+    work_dir = Path(task.work_dir)
+    target = _safe_workspace_path(work_dir, file_path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"파일을 찾을 수 없습니다: {file_path}")
+    if target.is_dir():
+        raise HTTPException(status_code=400, detail="디렉터리는 /task/{id}/files로 조회하세요.")
+
+    if tail is not None:
+        # 텍스트로 해석하여 tail
+        try:
+            size = target.stat().st_size
+            with open(target, "rb") as f:
+                if size > 1024 * 1024:
+                    f.seek(-256 * 1024, os.SEEK_END)
+                    f.readline()
+                content = f.read().decode("utf-8", errors="replace")
+            return PlainTextResponse("\n".join(content.splitlines()[-tail:]))
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"파일 읽기 실패: {e}")
+
+    # 전체 파일 다운로드 (바이너리 안전)
+    return FileResponse(str(target), filename=target.name)
 
 
 @app.delete("/task/{task_id}")
