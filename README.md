@@ -818,6 +818,63 @@ curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/saved/LightGCN-Mar-30-2026.pt
 
 Path traversal (`..`) is blocked — requests resolving outside the workspace return 400.
 
+### CPU Task Support (v0.8.0)
+
+For workloads that don't need a GPU (data preprocessing, classic ML, RecBole eval, offline inference), pass `device=cpu` to keep the GPU pool free for training.
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/pool` | GET | Unified GPU + CPU pool status (v0.8.0~) |
+| `/tasks?device=cpu\|gpu` | GET | Filter task list by device |
+| `/run/async`, `/run/sync`, `/run/project` | POST | New `device` field: `"gpu"` (default) or `"cpu"` |
+
+**CPU slot auto-detection** — slot count is computed at server start using `os.sched_getaffinity(0)` (respects cgroups/taskset), reserving 25% or 4 cores (whichever is larger) as headroom for GPU DataLoader workers and the OS, then dividing the remainder by 4 (assumed average cores per CPU task), capped at 16. Override with `VRUNGPU_CPU_SLOTS=N` env.
+
+| Host cores | Slots | Rationale |
+|-----------:|------:|-----------|
+| 4 | 1 | Minimum |
+| 16 | 3 | 12 effective ÷ 4 |
+| 32 | 6 | 24 effective ÷ 4 |
+| 64 | 12 | 48 effective ÷ 4 |
+| 128+ | 16 | Upper cap |
+
+**Example — submit CPU preprocessing job**:
+
+```bash
+curl -X POST "http://{SERVER_IP}:9825/run/async" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "code": "import pandas as pd\ndf = pd.read_csv(\"/data/large.csv\")\nprint(df.describe())",
+    "name": "preprocess_job",
+    "device": "cpu"
+  }'
+```
+
+**Example — run RecBole eval on CPU while training runs on GPU**:
+
+```bash
+curl -X POST "http://{SERVER_IP}:9825/run/project" \
+  -F "file=@eval_project.zip" \
+  -F "entry_point=run_eval.py" \
+  -F "device=cpu"
+```
+
+**Example — check pool status**:
+
+```bash
+curl "http://{SERVER_IP}:9825/pool"
+# {
+#   "gpu": {"total_gpus": 2, "available_gpus": [1], "busy_gpus": {"task-abc": 0}},
+#   "cpu": {"max_slots": 6, "in_use": 1, "tasks": ["task-xyz"], "auto_detected": true}
+# }
+```
+
+**What happens to CPU tasks internally** — `CUDA_VISIBLE_DEVICES=""` and `VRUNGPU_DEVICE="cpu"` are injected into the subprocess env. The task runs in a separate CPU slot pool from the GPU pool, so a CPU task never blocks GPU scheduling and vice versa. CPU and GPU tasks can run concurrently.
+
+**Recommended CPU workloads**: pandas/numpy preprocessing, scikit-learn/xgboost, RecBole `eval_args.mode=full` evaluation, offline inference on small models.
+
+**Not recommended on CPU**: LLM fine-tuning, large tensor ops — practical speed is too low. If you try, it is permitted but will be slow.
+
 ### File Upload Endpoints
 
 | Endpoint | Method | Description |
@@ -1100,6 +1157,7 @@ Response:
 
 ## Version History
 
+- **v0.8.0** - CPU Task Support: `device="cpu"` opt-in for `/run/async`, `/run/sync`, `/run/project` routes the task to a separate `CPUSlotPool` with auto-detected slot count (`os.sched_getaffinity` → headroom 25%/4-core → divide by 4, cap 16). GPU pool untouched, so CPU and GPU tasks run concurrently without contention. New `GET /pool` endpoint (unified GPU+CPU view), `?device=cpu|gpu` filter on `/tasks`, `VRUNGPU_CPU_SLOTS=N` env override. Subprocesses get `CUDA_VISIBLE_DEVICES=""` + `VRUNGPU_DEVICE="cpu"`. Idempotent DB migration adds `tasks.device` column defaulting to `"gpu"`.
 - **v0.7.0** - Task Management API: `POST /task/{id}/cancel` (SIGTERM→SIGKILL, GPU auto-release), `GET /task/{id}/logs?source=stdout|stderr|all|workspace` (ring-buffer tail for running tasks, file-based tail for frameworks like RecBole that bypass stdout), `GET /task/{id}/logs/stream` (SSE live tail), `GET /task/{id}/files` + `/files/{path}` (workspace browsing with path-traversal protection). Preserves `cancelled` status instead of overwriting with `failed`.
 - **v0.6.0** - Multi-GPU LLM (GPU별 독립 인스턴스, 동시 서빙), File Upload API, DPO fine-tuning (TRL DPOTrainer + LoRA), fix asyncio LimitOverrunError on large subprocess output
 - **v0.5.0** - LLM Chat API (Qwen2.5/Qwen3/Qwen3.5, Qwen2.5-VL), SFT LoRA fine-tuning, server-side chat sessions, model aliases, auto GPU switching

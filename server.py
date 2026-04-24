@@ -151,6 +151,11 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_models_task ON models(task_id);
         """)
 
+        # v0.8.0 migration: tasks.device 컬럼 추가 (idempotent)
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(tasks)").fetchall()]
+        if "device" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN device TEXT NOT NULL DEFAULT 'gpu'")
+
 
 @contextmanager
 def get_db():
@@ -189,6 +194,7 @@ class TaskResult(BaseModel):
     status: TaskStatus
     task_type: TaskType = TaskType.TRAINING
     gpu_id: int | None = None
+    device: str = "gpu"  # "gpu" | "cpu" (v0.8.0~)
     created_at: datetime
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -224,7 +230,8 @@ class CodeRequest(BaseModel):
     code: str = Field(..., description="실행할 Python 코드")
     name: str | None = Field(default=None, description="작업 이름")
     timeout: int | None = Field(default=None, description="타임아웃 (초), None=무제한")
-    gpu_id: int | None = Field(default=None, description="사용할 GPU ID")
+    gpu_id: int | None = Field(default=None, description="사용할 GPU ID (device=gpu일 때)")
+    device: str = Field(default="gpu", description="실행 장치: 'gpu' (기본) 또는 'cpu'")
     save_model: bool = Field(default=False, description="학습 완료 후 모델 저장")
     model_name: str | None = Field(default=None, description="저장할 모델 이름")
 
@@ -252,6 +259,18 @@ class GPUPoolStatus(BaseModel):
     total_gpus: int
     available_gpus: list[int]
     busy_gpus: dict[str, int]
+
+
+class CPUPoolStatus(BaseModel):
+    max_slots: int
+    in_use: int
+    tasks: list[str] = []
+    auto_detected: bool = True
+
+
+class PoolStatus(BaseModel):
+    gpu: GPUPoolStatus
+    cpu: CPUPoolStatus
 
 
 class ProgressUpdate(BaseModel):
@@ -412,6 +431,74 @@ class GPUPool:
             }
 
 
+def detect_cpu_slots() -> tuple[int, bool]:
+    """CPU slot 수 결정. env VRUNGPU_CPU_SLOTS 우선, 없으면 자동 감지.
+
+    반환: (slots, auto_detected)
+      - slots: 동시 실행 가능 CPU task 수 (task 하나당 평균 4 core 가정)
+      - auto_detected: env 오버라이드 없이 자동 계산되었는지
+    """
+    env_val = os.getenv("VRUNGPU_CPU_SLOTS")
+    if env_val:
+        try:
+            n = int(env_val)
+            if n >= 1:
+                return n, False
+        except ValueError:
+            pass
+
+    try:
+        available = len(os.sched_getaffinity(0))  # cgroups/taskset 반영
+    except AttributeError:
+        available = os.cpu_count() or 1
+
+    headroom = max(4, available // 4)        # GPU DataLoader + OS 여유분
+    effective = max(1, available - headroom)
+    slots = effective // 4                    # task당 약 4 core 가정
+    return max(1, min(slots, 16)), True       # 상한 16
+
+
+class CPUSlotPool:
+    """CPU slot 풀 — 동시 실행 제한으로 CPU 경합 완화.
+
+    GPU 풀과 독립. 기본 슬롯 수는 자동 감지(detect_cpu_slots).
+    env VRUNGPU_CPU_SLOTS=N 으로 명시 설정 가능.
+    """
+
+    def __init__(self, max_slots: int, auto_detected: bool):
+        self._max_slots = max_slots
+        self._auto_detected = auto_detected
+        self._sem: asyncio.Semaphore | None = None  # lazy: event loop 시작 후 생성
+        self._in_use: set[str] = set()
+
+    def _get_sem(self) -> asyncio.Semaphore:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self._max_slots)
+        return self._sem
+
+    @property
+    def max_slots(self) -> int:
+        return self._max_slots
+
+    async def acquire(self, task_id: str):
+        """slot 대기 후 획득. 비동기, 취소 가능."""
+        await self._get_sem().acquire()
+        self._in_use.add(task_id)
+
+    def release(self, task_id: str):
+        self._in_use.discard(task_id)
+        if self._sem is not None:
+            self._sem.release()
+
+    def get_status(self) -> dict:
+        return {
+            "max_slots": self._max_slots,
+            "in_use": len(self._in_use),
+            "tasks": list(self._in_use),
+            "auto_detected": self._auto_detected,
+        }
+
+
 # ============================================================================
 # Database Task Operations
 # ============================================================================
@@ -421,13 +508,13 @@ def save_task(task: TaskResult):
     with get_db() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO tasks
-            (task_id, name, status, task_type, gpu_id, created_at, started_at,
+            (task_id, name, status, task_type, gpu_id, device, created_at, started_at,
              completed_at, stdout, stderr, return_code, error, work_dir,
              entry_point, config, progress, progress_message, model_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             task.task_id, task.name, task.status.value, task.task_type.value,
-            task.gpu_id, task.created_at.isoformat(),
+            task.gpu_id, task.device, task.created_at.isoformat(),
             task.started_at.isoformat() if task.started_at else None,
             task.completed_at.isoformat() if task.completed_at else None,
             task.stdout, task.stderr, task.return_code, task.error,
@@ -446,7 +533,12 @@ def get_task(task_id: str) -> TaskResult | None:
     return None
 
 
-def get_tasks(limit: int = 50, status: str | None = None, task_type: str | None = None) -> list[TaskResult]:
+def get_tasks(
+    limit: int = 50,
+    status: str | None = None,
+    task_type: str | None = None,
+    device: str | None = None,
+) -> list[TaskResult]:
     """작업 목록 조회"""
     with get_db() as conn:
         query = "SELECT * FROM tasks WHERE 1=1"
@@ -457,6 +549,9 @@ def get_tasks(limit: int = 50, status: str | None = None, task_type: str | None 
         if task_type:
             query += " AND task_type = ?"
             params.append(task_type)
+        if device:
+            query += " AND device = ?"
+            params.append(device)
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         rows = conn.execute(query, params).fetchall()
@@ -465,12 +560,18 @@ def get_tasks(limit: int = 50, status: str | None = None, task_type: str | None 
 
 def _row_to_task(row) -> TaskResult:
     """DB row를 TaskResult로 변환"""
+    # v0.7.0 이전 DB와의 호환: device 컬럼이 없거나 NULL인 경우 'gpu'로 fallback
+    try:
+        device_val = row["device"] or "gpu"
+    except (IndexError, KeyError):
+        device_val = "gpu"
     return TaskResult(
         task_id=row["task_id"],
         name=row["name"],
         status=TaskStatus(row["status"]),
         task_type=TaskType(row["task_type"]) if row["task_type"] else TaskType.TRAINING,
         gpu_id=row["gpu_id"],
+        device=device_val,
         created_at=datetime.fromisoformat(row["created_at"]),
         started_at=datetime.fromisoformat(row["started_at"]) if row["started_at"] else None,
         completed_at=datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None,
@@ -557,6 +658,8 @@ def _row_to_model(row) -> ModelInfo:
 # ============================================================================
 
 gpu_pool = GPUPool()
+_cpu_slots, _cpu_auto = detect_cpu_slots()
+cpu_pool = CPUSlotPool(_cpu_slots, _cpu_auto)
 websocket_clients: set[WebSocket] = set()
 running_tasks: dict[str, TaskResult] = {}  # 메모리 캐시 (실행 중인 작업만)
 
@@ -757,7 +860,7 @@ init_database()
 app = FastAPI(
     title="VrunGPU",
     description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리 + LLM Chat)",
-    version="0.7.0",
+    version="0.8.0",
 )
 
 app.add_middleware(
@@ -872,25 +975,37 @@ async def run_task_with_streaming(
     gpu_id: int | None,
     save_model: bool = False,
     model_name: str | None = None,
+    device: str = "gpu",
 ):
-    """실시간 스트리밍과 함께 작업 실행"""
+    """실시간 스트리밍과 함께 작업 실행. device='cpu'면 GPU 풀 대신 CPU slot 풀 사용."""
     task = running_tasks.get(task_id) or get_task(task_id)
     if not task:
         return
 
     running_tasks[task_id] = task
+    task.device = device
 
-    # GPU 할당 대기
-    assigned_gpu = None
-    while assigned_gpu is None:
-        assigned_gpu = gpu_pool.acquire(task_id, gpu_id)
-        if assigned_gpu is None:
-            task.status = TaskStatus.QUEUED
-            save_task(task)
-            await broadcast_task_update(task)
-            await asyncio.sleep(1)
+    # 장치별 자원 획득
+    assigned_gpu: int | None = None
+    cpu_slot_held = False
+    if device == "cpu":
+        task.status = TaskStatus.QUEUED
+        save_task(task)
+        await broadcast_task_update(task)
+        await cpu_pool.acquire(task_id)
+        cpu_slot_held = True
+        task.gpu_id = None
+    else:
+        # GPU 할당 대기
+        while assigned_gpu is None:
+            assigned_gpu = gpu_pool.acquire(task_id, gpu_id)
+            if assigned_gpu is None:
+                task.status = TaskStatus.QUEUED
+                save_task(task)
+                await broadcast_task_update(task)
+                await asyncio.sleep(1)
+        task.gpu_id = assigned_gpu
 
-    task.gpu_id = assigned_gpu
     task.status = TaskStatus.RUNNING
     task.started_at = datetime.now()
     save_task(task)
@@ -898,7 +1013,12 @@ async def run_task_with_streaming(
     await broadcast_gpu_update()
 
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+    if device == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["VRUNGPU_DEVICE"] = "cpu"
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+        env["VRUNGPU_DEVICE"] = "gpu"
     env["PYTHONUNBUFFERED"] = "1"
     env["VRUNGPU_TASK_ID"] = task_id
     env["VRUNGPU_MODEL_DIR"] = str(MODELS_DIR)
@@ -1008,7 +1128,10 @@ async def run_task_with_streaming(
     finally:
         task.completed_at = datetime.now()
         save_task(task)
-        gpu_pool.release(assigned_gpu)
+        if cpu_slot_held:
+            cpu_pool.release(task_id)
+        elif assigned_gpu is not None:
+            gpu_pool.release(assigned_gpu)
         running_tasks.pop(task_id, None)
         task_processes.pop(task_id, None)
         task_log_buffers.pop(task_id, None)
@@ -1117,12 +1240,16 @@ async def root():
     with get_db() as conn:
         total_tasks = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         total_models = conn.execute("SELECT COUNT(*) FROM models").fetchone()[0]
+    cpu_status = cpu_pool.get_status()
     return {
         "service": "VrunGPU",
         "status": "running",
-        "version": "0.7.0",
+        "version": "0.8.0",
         "gpu_count": pool_status["total_gpus"],
         "available_gpus": len(pool_status["available_gpus"]),
+        "cpu_slots": cpu_status["max_slots"],
+        "cpu_slots_in_use": cpu_status["in_use"],
+        "cpu_auto_detected": cpu_status["auto_detected"],
         "total_tasks": total_tasks,
         "total_models": total_models,
         "storage": {
@@ -1138,7 +1265,7 @@ async def get_usage_help():
     """VrunGPU 사용방법 문서 (원격 조회 가능)"""
     return {
         "service": "VrunGPU",
-        "version": "0.7.0",
+        "version": "0.8.0",
         "description": "원격 GPU 학습/추론 실행 서버 + Multi-GPU LLM Chat API",
 
         "llm_models": {
@@ -1322,8 +1449,35 @@ curl "http://{SERVER_IP}:9825/llm/status"''',
   -F "file=@my_project.zip" \\
   -F "name=my_training" \\
   -F "entry_point=train.py" \\
-  -F "gpu_id=0"''',
-                "note": "ZIP 내 entry_point 파일을 실행. [PROGRESS:50.0:msg] 형식으로 진행률 보고 가능"
+  -F "gpu_id=0"
+
+# CPU로 실행 (전처리/classic ML/offline eval 등)
+curl -X POST "http://{SERVER_IP}:9825/run/project" \\
+  -F "file=@eval_project.zip" \\
+  -F "name=offline_eval" \\
+  -F "entry_point=run_eval.py" \\
+  -F "device=cpu"''',
+                "note": "ZIP 내 entry_point 파일을 실행. [PROGRESS:50.0:msg] 형식으로 진행률 보고 가능. device=cpu 지정 시 CPU slot 풀 사용"
+            },
+
+            "run_cpu": {
+                "description": "CPU task 실행 (v0.8.0~). GPU 미사용 워크로드 처리.",
+                "endpoint": "POST /run/async",
+                "curl_example": '''curl -X POST "http://{SERVER_IP}:9825/run/async" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "code": "import pandas as pd\\ndf = pd.read_csv(\\"/data/large.csv\\")\\nprint(df.describe())",
+    "name": "preprocess_job",
+    "device": "cpu"
+  }' ''',
+                "note": "CPU slot은 자동 감지 (VRUNGPU_CPU_SLOTS env로 오버라이드). GET /pool로 현황 확인. GPU 풀과 독립되어 GPU 작업과 동시 실행 가능"
+            },
+
+            "pool_status": {
+                "description": "GPU + CPU 풀 통합 상태 (v0.8.0)",
+                "endpoint": "GET /pool",
+                "curl_example": 'curl "http://{SERVER_IP}:9825/pool"',
+                "response_example": '{"gpu": {"total_gpus": 2, "available_gpus": [1], "busy_gpus": {"task-id": 0}}, "cpu": {"max_slots": 4, "in_use": 1, "tasks": ["task-xyz"], "auto_detected": true}}'
             },
 
             "vision_language": {
@@ -1439,12 +1593,19 @@ curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/log/LightGCN/train.log?tail=5
                 "DELETE /upload/{file_id} - 삭제"
             ],
             "Training API": [
-                "POST /run/sync - 동기 실행 (결과 대기)",
-                "POST /run/async - 비동기 실행 (즉시 반환)",
-                "POST /run/project - 프로젝트 ZIP 업로드 후 실행",
+                "POST /run/sync - 동기 실행 (결과 대기, device=gpu|cpu)",
+                "POST /run/async - 비동기 실행 (즉시 반환, device=gpu|cpu)",
+                "POST /run/project - 프로젝트 ZIP 업로드 후 실행 (device=gpu|cpu form field)",
                 "GET  /task/{task_id} - 작업 상태 조회",
-                "GET  /tasks - 작업 목록 조회",
+                "GET  /tasks?device=cpu|gpu - 작업 목록 조회 (device 필터)",
                 "PUT  /task/{task_id}/progress - 진행률 외부 업데이트"
+            ],
+            "CPU Task API (v0.8.0)": [
+                "device=cpu 옵션으로 CPU 전용 실행 (GPU 풀 미점유, CUDA_VISIBLE_DEVICES='')",
+                "CPU slot 자동 감지 (VRUNGPU_CPU_SLOTS env로 오버라이드 가능)",
+                "GET /pool - GPU + CPU 풀 통합 상태 (v0.8.0 신규)",
+                "권장 워크로드: 전처리, classic ML (sklearn/xgboost), RecBole eval, offline inference",
+                "비권장: LLM 학습, 대규모 tensor 연산 (실용적 속도 X)"
             ],
             "Task Management API (v0.7.0)": [
                 "POST /task/{task_id}/cancel?timeout=5 - 실행 중인 task 취소 (SIGTERM → SIGKILL)",
@@ -1466,6 +1627,7 @@ curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/log/LightGCN/train.log?tail=5
                 "GET  /help - 사용방법 (이 문서)",
                 "GET  /gpu - GPU 상태 (개별 디바이스 정보)",
                 "GET  /gpu/pool - GPU 풀 상태 (예약 현황)",
+                "GET  /pool - GPU + CPU 풀 통합 상태 (v0.8.0~)",
                 "GET  /stats - 통계 정보",
                 "WS   /ws - WebSocket 실시간 모니터링"
             ]
@@ -1488,6 +1650,8 @@ curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/log/LightGCN/train.log?tail=5
             "파일 업로드: POST /upload로 데이터셋 등 업로드, 반환 path를 finetune 등에서 직접 사용",
             "Task 관측/제어: /task/{id}/logs (tail), /task/{id}/logs/stream (SSE), /task/{id}/files (파일 트리), /task/{id}/cancel (안전 종료)",
             "RecBole 등 자체 로그 파일 쓰는 프레임워크는 ?source=workspace 로 진행 상황 조회 가능 (stdout 비어있어도 OK)",
+            "CPU Task (v0.8.0): device='cpu' 옵션으로 GPU 미사용 워크로드 처리. 전처리/classic ML/RecBole eval 권장. LLM 학습 비권장",
+            "CPU slot 자동 감지: os.sched_getaffinity() 기반, task당 4 core 가정, 상한 16. VRUNGPU_CPU_SLOTS=N 으로 오버라이드",
             "/llm/chat에 session_id로 멀티턴 대화 세션 지원 (TTL 4시간)",
             "V100S 32GB x2 GPU 환경 기준입니다.",
             "Dashboard: http://{SERVER_IP}:9824",
@@ -1506,15 +1670,29 @@ async def get_gpu_pool_status():
     return gpu_pool.get_status()
 
 
+@app.get("/pool", response_model=PoolStatus)
+async def get_pool_status():
+    """GPU + CPU 풀 통합 상태 (v0.8.0~)"""
+    return {
+        "gpu": gpu_pool.get_status(),
+        "cpu": cpu_pool.get_status(),
+    }
+
+
 # ============================================================================
 # API Endpoints - Tasks
 # ============================================================================
 
 @app.post("/run/sync", response_model=TaskResult)
 async def run_sync(request: CodeRequest):
-    """동기 실행 (결과를 기다림, LLM 자동 중지)"""
-    # GPU 확보를 위해 LLM 서비스 자동 중지
-    await ensure_llm_stopped()
+    """동기 실행 (결과를 기다림, LLM 자동 중지). device='cpu' 지원 (CPU slot 확보 대기)."""
+    device = (request.device or "gpu").lower()
+    if device not in ("gpu", "cpu"):
+        raise HTTPException(status_code=400, detail="device는 'gpu' 또는 'cpu'만 가능합니다.")
+
+    # GPU 확보를 위해 LLM 서비스 자동 중지 (GPU 경로만)
+    if device == "gpu":
+        await ensure_llm_stopped()
 
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
@@ -1523,10 +1701,16 @@ async def run_sync(request: CodeRequest):
     script_path = work_dir / "main.py"
     script_path.write_text(request.code)
 
-    assigned_gpu = gpu_pool.acquire(task_id, request.gpu_id)
-    if assigned_gpu is None and request.gpu_id is not None:
-        shutil.rmtree(work_dir, ignore_errors=True)
-        raise HTTPException(status_code=409, detail=f"GPU {request.gpu_id}가 사용 중입니다.")
+    assigned_gpu: int | None = None
+    cpu_slot_held = False
+    if device == "cpu":
+        await cpu_pool.acquire(task_id)
+        cpu_slot_held = True
+    else:
+        assigned_gpu = gpu_pool.acquire(task_id, request.gpu_id)
+        if assigned_gpu is None and request.gpu_id is not None:
+            shutil.rmtree(work_dir, ignore_errors=True)
+            raise HTTPException(status_code=409, detail=f"GPU {request.gpu_id}가 사용 중입니다.")
 
     task = TaskResult(
         task_id=task_id,
@@ -1534,6 +1718,7 @@ async def run_sync(request: CodeRequest):
         status=TaskStatus.RUNNING,
         task_type=TaskType.TRAINING,
         gpu_id=assigned_gpu,
+        device=device,
         created_at=datetime.now(),
         started_at=datetime.now(),
         work_dir=str(work_dir),
@@ -1542,8 +1727,13 @@ async def run_sync(request: CodeRequest):
     save_task(task)
 
     env = os.environ.copy()
-    if assigned_gpu is not None:
-        env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+    if device == "cpu":
+        env["CUDA_VISIBLE_DEVICES"] = ""
+        env["VRUNGPU_DEVICE"] = "cpu"
+    else:
+        if assigned_gpu is not None:
+            env["CUDA_VISIBLE_DEVICES"] = str(assigned_gpu)
+        env["VRUNGPU_DEVICE"] = "gpu"
 
     try:
         result = subprocess.run(
@@ -1567,7 +1757,9 @@ async def run_sync(request: CodeRequest):
         task.error = str(e)
     finally:
         task.completed_at = datetime.now()
-        if assigned_gpu is not None:
+        if cpu_slot_held:
+            cpu_pool.release(task_id)
+        elif assigned_gpu is not None:
             gpu_pool.release(assigned_gpu)
         save_task(task)
 
@@ -1587,11 +1779,16 @@ async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
     script_path = work_dir / "main.py"
     script_path.write_text(request.code)
 
+    device = (request.device or "gpu").lower()
+    if device not in ("gpu", "cpu"):
+        raise HTTPException(status_code=400, detail="device는 'gpu' 또는 'cpu'만 가능합니다.")
+
     task = TaskResult(
         task_id=task_id,
         name=request.name or f"async_{task_id[:8]}",
         status=TaskStatus.PENDING,
         task_type=TaskType.TRAINING,
+        device=device,
         created_at=datetime.now(),
         work_dir=str(work_dir),
         entry_point="main.py",
@@ -1601,13 +1798,14 @@ async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(
         run_task_with_streaming, task_id, work_dir, "main.py",
-        request.timeout, request.gpu_id, request.save_model, request.model_name
+        request.timeout, request.gpu_id, request.save_model, request.model_name,
+        device,
     )
 
     return AsyncTaskResponse(
         task_id=task_id,
         status=TaskStatus.PENDING,
-        message="작업이 큐에 등록되었습니다.",
+        message=f"작업이 큐에 등록되었습니다. (device={device})",
     )
 
 
@@ -1618,6 +1816,7 @@ async def run_project(
     entry_point: str = Form(default="main.py"),
     timeout: int | None = Form(default=None),
     gpu_id: int | None = Form(default=None),
+    device: str = Form(default="gpu"),
     save_model: bool = Form(default=False),
     model_name: str | None = Form(default=None),
     background_tasks: BackgroundTasks = None,
@@ -1674,11 +1873,17 @@ async def run_project(
         shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="잘못된 ZIP 파일입니다.")
 
+    device_val = (device or "gpu").lower()
+    if device_val not in ("gpu", "cpu"):
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="device는 'gpu' 또는 'cpu'만 가능합니다.")
+
     task = TaskResult(
         task_id=task_id,
         name=name or f"project_{task_id[:8]}",
         status=TaskStatus.PENDING,
         task_type=TaskType.TRAINING,
+        device=device_val,
         created_at=datetime.now(),
         work_dir=str(work_dir),
         entry_point=entry_point,
@@ -1688,13 +1893,14 @@ async def run_project(
 
     background_tasks.add_task(
         run_task_with_streaming, task_id, work_dir, entry_point,
-        timeout, gpu_id, save_model, model_name
+        timeout, gpu_id, save_model, model_name,
+        device_val,
     )
 
     return AsyncTaskResponse(
         task_id=task_id,
         status=TaskStatus.PENDING,
-        message=f"프로젝트가 업로드되었습니다. Entry: {entry_point}",
+        message=f"프로젝트가 업로드되었습니다. Entry: {entry_point} (device={device_val})",
     )
 
 
@@ -1836,9 +2042,10 @@ async def list_tasks(
     limit: int = Query(default=50, le=200),
     status: str | None = Query(default=None),
     task_type: str | None = Query(default=None),
+    device: str | None = Query(default=None, description="'gpu' | 'cpu'"),
 ):
     """작업 목록 조회"""
-    return get_tasks(limit=limit, status=status, task_type=task_type)
+    return get_tasks(limit=limit, status=status, task_type=task_type, device=device)
 
 
 @app.put("/task/{task_id}/progress")
