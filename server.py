@@ -877,18 +877,33 @@ app.add_middleware(
 # ============================================================================
 
 async def broadcast(message: dict):
-    """모든 WebSocket 클라이언트에 메시지 전송"""
+    """모든 WebSocket 클라이언트에 메시지 전송.
+
+    iteration 도중 disconnect가 set을 변경해도 안전하도록 snapshot 사용.
+    """
     dead_clients = set()
-    for ws in websocket_clients:
+    for ws in list(websocket_clients):  # snapshot: 동시 수정 방어
         try:
             await ws.send_json(message)
         except Exception:
             dead_clients.add(ws)
-    websocket_clients.difference_update(dead_clients)
+    if dead_clients:
+        websocket_clients.difference_update(dead_clients)
+
+
+# broadcast 페이로드에서 stdout/stderr 최대 크기 (바이트) — 과도한 WS 프레임 방지
+_BROADCAST_STDIO_TAIL = 64 * 1024
+
+
+def _truncate_tail(text: str | None, limit: int = _BROADCAST_STDIO_TAIL) -> str | None:
+    """긴 문자열은 tail만 유지 (WS 프레임 크기 제한 회피)."""
+    if not text or len(text) <= limit:
+        return text
+    return f"...[truncated {len(text) - limit} bytes]...\n" + text[-limit:]
 
 
 async def broadcast_task_update(task: TaskResult):
-    """작업 상태 업데이트 브로드캐스트"""
+    """작업 상태 업데이트 브로드캐스트. stdout/stderr는 tail만 포함."""
     await broadcast({
         "type": "task_update",
         "task": {
@@ -897,11 +912,12 @@ async def broadcast_task_update(task: TaskResult):
             "status": task.status.value,
             "task_type": task.task_type.value,
             "gpu_id": task.gpu_id,
+            "device": task.device,
             "created_at": task.created_at.isoformat(),
             "started_at": task.started_at.isoformat() if task.started_at else None,
             "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-            "stdout": task.stdout,
-            "stderr": task.stderr,
+            "stdout": _truncate_tail(task.stdout),
+            "stderr": _truncate_tail(task.stderr),
             "return_code": task.return_code,
             "error": task.error,
             "progress": task.progress,
@@ -912,13 +928,14 @@ async def broadcast_task_update(task: TaskResult):
 
 
 async def broadcast_gpu_update():
-    """GPU 상태 업데이트 브로드캐스트"""
+    """GPU + CPU 풀 상태 업데이트 브로드캐스트. (이름은 하위 호환을 위해 유지)"""
     gpu_info = get_gpu_info()
     pool_status = gpu_pool.get_status()
     await broadcast({
         "type": "gpu_update",
         "gpus": gpu_info.devices,
         "pool": pool_status,
+        "cpu": cpu_pool.get_status(),
     })
 
 
@@ -1203,6 +1220,7 @@ async def websocket_endpoint(websocket: WebSocket):
         "type": "init",
         "gpus": gpu_info.devices,
         "pool": pool_status,
+        "cpu": cpu_pool.get_status(),
         "tasks": [
             {
                 "task_id": t.task_id,
@@ -1210,11 +1228,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 "status": t.status.value,
                 "task_type": t.task_type.value,
                 "gpu_id": t.gpu_id,
+                "device": t.device,
                 "created_at": t.created_at.isoformat(),
                 "started_at": t.started_at.isoformat() if t.started_at else None,
                 "completed_at": t.completed_at.isoformat() if t.completed_at else None,
-                "stdout": t.stdout,
-                "stderr": t.stderr,
+                "stdout": _truncate_tail(t.stdout),
+                "stderr": _truncate_tail(t.stderr),
                 "return_code": t.return_code,
                 "error": t.error,
                 "progress": t.progress,

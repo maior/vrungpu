@@ -19,6 +19,7 @@ interface Task {
   status: string;
   task_type?: string;
   gpu_id: number | null;
+  device?: string;  // "gpu" | "cpu" (v0.8.0~)
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
@@ -29,6 +30,13 @@ interface Task {
   progress?: number;
   progress_message?: string;
   model_id?: string;
+}
+
+interface CPUPool {
+  max_slots: number;
+  in_use: number;
+  tasks: string[];
+  auto_detected: boolean;
 }
 
 interface Model {
@@ -508,6 +516,8 @@ function DonutChart({ data }: { data: { label: string; value: number; color: str
 export default function Dashboard() {
   const [connected, setConnected] = useState(false);
   const [gpus, setGpus] = useState<GPU[]>([]);
+  const [cpuPool, setCpuPool] = useState<CPUPool | null>(null);
+  const [submitDevice, setSubmitDevice] = useState<"gpu" | "cpu">("gpu");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [models, setModels] = useState<Model[]>([]);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
@@ -579,10 +589,12 @@ export default function Dashboard() {
         case "init":
           setGpus(data.gpus || []);
           setTasks(data.tasks || []);
+          if (data.cpu) setCpuPool(data.cpu as CPUPool);
           break;
 
         case "gpu_update":
           setGpus(data.gpus || []);
+          if (data.cpu) setCpuPool(data.cpu as CPUPool);
           // Record history
           if (data.gpus && data.gpus.length > 0) {
             setMetricHistory(prev => {
@@ -650,7 +662,7 @@ export default function Dashboard() {
       await fetch(`${getApiUrl()}/run/async`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code, timeout: 3600 }),
+        body: JSON.stringify({ code, timeout: 3600, device: submitDevice }),
       });
       setCode("");
     } catch {
@@ -667,6 +679,7 @@ export default function Dashboard() {
       formData.append("file", uploadFile);
       formData.append("entry_point", entryPoint);
       formData.append("timeout", "3600");
+      formData.append("device", submitDevice);
 
       await fetch(`${getApiUrl()}/run/project`, {
         method: "POST",
@@ -861,7 +874,7 @@ export default function Dashboard() {
                 <h1 className="text-xl font-bold bg-gradient-to-r from-white to-slate-400 bg-clip-text text-transparent">
                   VrunGPU Dashboard
                 </h1>
-                <p className="text-xs text-slate-500">Remote GPU Execution Server v0.4.0</p>
+                <p className="text-xs text-slate-500">Remote GPU Execution Server v0.8.0</p>
               </div>
             </div>
 
@@ -916,11 +929,17 @@ export default function Dashboard() {
         {mainTab === "dashboard" ? (
           <>
             {/* Stats Overview */}
-            <div className="grid grid-cols-4 gap-4 mb-8">
+            <div className="grid grid-cols-5 gap-4 mb-8">
               {[
                 { label: "Total GPUs", value: gpus.length, icon: "GPU", color: "from-blue-500 to-cyan-500" },
                 { label: "Active Tasks", value: busyGPUs, icon: "RUN", color: "from-emerald-500 to-teal-500" },
-                { label: "Avg Utilization", value: `${avgUtilization}%`, icon: "CPU", color: "from-purple-500 to-pink-500" },
+                {
+                  label: "CPU Slots",
+                  value: cpuPool ? `${cpuPool.in_use}/${cpuPool.max_slots}` : "-",
+                  icon: "CPU",
+                  color: "from-indigo-500 to-sky-500",
+                },
+                { label: "Avg Utilization", value: `${avgUtilization}%`, icon: "UTIL", color: "from-purple-500 to-pink-500" },
                 { label: "Memory Used", value: `${Math.round(usedMemory / 1024)}GB`, icon: "MEM", color: "from-amber-500 to-orange-500" },
               ].map((stat, idx) => (
                 <div
@@ -1003,6 +1022,47 @@ export default function Dashboard() {
                       </div>
                     ))}
                   </div>
+                </div>
+
+                {/* CPU Pool Status (v0.8.0) */}
+                <div className="rounded-2xl glass p-6 mt-6 opacity-0 animate-fade-in-up stagger-3" style={{ animationFillMode: 'forwards' }}>
+                  <h2 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-indigo-500 animate-pulse" />
+                    CPU Pool
+                    {cpuPool?.auto_detected && (
+                      <span className="ml-1 px-2 py-0.5 rounded-md text-[10px] uppercase tracking-wide bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">auto</span>
+                    )}
+                  </h2>
+                  {cpuPool ? (
+                    <>
+                      <div className="flex items-end gap-3 mb-3">
+                        <span className="text-3xl font-bold">{cpuPool.in_use}</span>
+                        <span className="text-slate-400 text-sm mb-1">/ {cpuPool.max_slots} slots in use</span>
+                      </div>
+                      <div className="h-2 bg-slate-800 rounded-full overflow-hidden mb-3">
+                        <div
+                          className="h-full bg-gradient-to-r from-indigo-500 to-sky-500 transition-all duration-500"
+                          style={{ width: `${cpuPool.max_slots > 0 ? (cpuPool.in_use / cpuPool.max_slots) * 100 : 0}%` }}
+                        />
+                      </div>
+                      {cpuPool.tasks.length > 0 ? (
+                        <div className="flex flex-wrap gap-2">
+                          {cpuPool.tasks.map(tid => (
+                            <span
+                              key={tid}
+                              className="px-2 py-1 rounded-md text-[11px] font-mono bg-indigo-500/10 text-indigo-300 border border-indigo-500/20"
+                            >
+                              {tid.slice(0, 12)}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-xs text-slate-500">No CPU tasks running.</p>
+                      )}
+                    </>
+                  ) : (
+                    <p className="text-sm text-slate-500">Loading CPU pool…</p>
+                  )}
                 </div>
 
                 {/* GPU History Chart */}
@@ -1099,6 +1159,34 @@ export default function Dashboard() {
                     </button>
                   </div>
 
+                  {/* Device selector (v0.8.0) */}
+                  <div className="flex items-center gap-2 mb-4">
+                    <span className="text-xs uppercase tracking-wide text-slate-500">Device</span>
+                    <div className="flex bg-slate-800/50 rounded-lg p-1 flex-1">
+                      <button
+                        className={`flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-200 ${
+                          submitDevice === "gpu"
+                            ? "bg-blue-500/80 text-white shadow shadow-blue-500/20"
+                            : "text-slate-400 hover:text-white hover:bg-slate-700/50"
+                        }`}
+                        onClick={() => setSubmitDevice("gpu")}
+                      >
+                        GPU
+                      </button>
+                      <button
+                        className={`flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-all duration-200 ${
+                          submitDevice === "cpu"
+                            ? "bg-indigo-500/80 text-white shadow shadow-indigo-500/20"
+                            : "text-slate-400 hover:text-white hover:bg-slate-700/50"
+                        }`}
+                        onClick={() => setSubmitDevice("cpu")}
+                        title={cpuPool ? `${cpuPool.in_use}/${cpuPool.max_slots} slots in use` : ""}
+                      >
+                        CPU{cpuPool ? ` (${cpuPool.in_use}/${cpuPool.max_slots})` : ""}
+                      </button>
+                    </div>
+                  </div>
+
                   <div className="relative overflow-hidden">
                     <div className={`transition-all duration-300 ease-out ${activeTab === "code" ? "opacity-100 translate-x-0" : "opacity-0 -translate-x-full absolute inset-0"}`}>
                       <textarea
@@ -1190,7 +1278,7 @@ export default function Dashboard() {
                       <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Type</th>
                       <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Status</th>
                       <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Progress</th>
-                      <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">GPU</th>
+                      <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Device</th>
                       <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Duration</th>
                       <th className="px-5 py-4 text-left text-xs font-medium text-slate-400 uppercase tracking-wider">Result</th>
                     </tr>
@@ -1246,9 +1334,13 @@ export default function Dashboard() {
                             )}
                           </td>
                           <td className="px-5 py-4 text-sm text-slate-400">
-                            {task.gpu_id !== null ? (
+                            {task.device === "cpu" ? (
+                              <span className="px-2 py-1 rounded-md bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 text-xs">CPU</span>
+                            ) : task.gpu_id !== null ? (
                               <span className="px-2 py-1 rounded-md bg-slate-700/50 text-xs transition-all duration-200 hover:bg-slate-600/50">GPU {task.gpu_id}</span>
-                            ) : "-"}
+                            ) : (
+                              "-"
+                            )}
                           </td>
                           <td className="px-5 py-4 text-sm text-slate-400">
                             {formatDuration(task.started_at, task.completed_at)}
@@ -1522,7 +1614,14 @@ export default function Dashboard() {
               <div className="grid grid-cols-4 gap-4 mb-6">
                 {[
                   { label: "Task ID", value: selectedTask.task_id.slice(0, 16) + "..." },
-                  { label: "GPU", value: selectedTask.gpu_id !== null ? `GPU ${selectedTask.gpu_id}` : "-" },
+                  {
+                    label: "Device",
+                    value: selectedTask.device === "cpu"
+                      ? "CPU"
+                      : selectedTask.gpu_id !== null
+                        ? `GPU ${selectedTask.gpu_id}`
+                        : "-",
+                  },
                   { label: "Duration", value: formatDuration(selectedTask.started_at, selectedTask.completed_at) },
                   { label: "Return Code", value: selectedTask.return_code ?? "-" },
                 ].map((item, idx) => (
