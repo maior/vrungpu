@@ -38,6 +38,12 @@ out/
 # Logs
 *.log
 npm-debug.log*
+logs/*
+!logs/.gitkeep
+
+# Runtime state (PID files etc.)
+run/*
+!run/.gitkeep
 
 # Temp
 tmp/

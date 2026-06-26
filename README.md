@@ -83,11 +83,28 @@ cd dashboard && npm install && npm run build
 
 ### Running the Server
 
-```bash
-# Start backend (port 9825)
-.venv/bin/python server.py
+Use the helper scripts in `scripts/` — they handle PID files, log rotation, and ready-checks:
 
-# Start dashboard (port 9824)
+```bash
+./scripts/start.sh     # start backend (port 9825) in the background
+./scripts/stop.sh      # graceful stop (SIGTERM → SIGKILL after 10s)
+./scripts/restart.sh   # stop + start
+./scripts/status.sh    # PID, uptime, GPU + CPU pool, recent logs, running tasks
+```
+
+Logs are written to `logs/server-YYYYMMDD-HHMMSS.log` and the symlink `logs/current.log` always points to the active log. The PID is kept in `run/vrungpu.pid`. Old logs older than 30 days are auto-pruned on start.
+
+Override defaults via env vars: `VRUNGPU_PORT`, `VRUNGPU_HOST`, `VRUNGPU_PYTHON`, `VRUNGPU_STOP_GRACE`, `VRUNGPU_LOG_RETENTION_DAYS`.
+
+To run in the foreground (for debugging), call Python directly:
+
+```bash
+.venv/bin/python server.py
+```
+
+Dashboard:
+
+```bash
 cd dashboard && npm run start -- -p 9824
 ```
 
