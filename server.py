@@ -69,6 +69,18 @@ MODEL_ALIASES = {
     "deepseek-8b": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
     "deepseek-14b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
     "gpt-oss-20b": "openai/gpt-oss-20b",
+    # Safety / Guard models (v0.8.1)
+    "meta-llama/Llama-Guard-3-8B": "meta-llama/Llama-Guard-3-8B",
+    "llama-guard-3": "meta-llama/Llama-Guard-3-8B",
+    "llama-guard-3-8b": "meta-llama/Llama-Guard-3-8B",
+    "google/shieldgemma-2b": "google/shieldgemma-2b",
+    "shieldgemma-2b": "google/shieldgemma-2b",
+    "ibm-granite/granite-guardian-3.1-2b": "ibm-granite/granite-guardian-3.1-2b",
+    "granite-guardian-2b": "ibm-granite/granite-guardian-3.1-2b",
+    "granite-guardian-3.1-2b": "ibm-granite/granite-guardian-3.1-2b",
+    "ibm-granite/granite-guardian-3.1-8b": "ibm-granite/granite-guardian-3.1-8b",
+    "granite-guardian-8b": "ibm-granite/granite-guardian-3.1-8b",
+    "granite-guardian-3.1-8b": "ibm-granite/granite-guardian-3.1-8b",
 }
 
 
@@ -287,6 +299,8 @@ class LLMGenerateRequest(BaseModel):
     top_k: int = Field(default=50, ge=0, description="Top-k 샘플링")
     do_sample: bool = Field(default=True, description="샘플링 사용 여부")
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트")
+    raw_prompt: bool = Field(default=False, description="True면 chat template 없이 prompt를 그대로 사용 (guard 모델 등)")
+    template_kwargs: dict | None = Field(default=None, description="apply_chat_template에 전달할 추가 인자 (예: guideline, guardian_config)")
 
 
 class LLMChatMessage(BaseModel):
@@ -305,6 +319,7 @@ class LLMChatRequest(BaseModel):
     do_sample: bool = Field(default=True)
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
     ei_gate: bool = Field(default=False, description="E-I gate computation")
+    template_kwargs: dict | None = Field(default=None, description="apply_chat_template에 전달할 추가 인자 (예: guideline, guardian_config)")
 
 
 class LLMInstanceInfo(BaseModel):
@@ -817,8 +832,7 @@ async def ensure_llm_running(model: str | None = None, gpu: int | None = None):
             raise HTTPException(status_code=409, detail=f"GPU {target_gpu}이(가) 사용 중입니다.")
 
         log_dir = Path("data/logs")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = open(log_dir / f"inference_server_gpu{target_gpu}.log", "w")
+        log_file, _log_path = _open_inference_log(target_gpu)
         process = subprocess.Popen(
             [sys.executable, str(LLM_SERVER_SCRIPT), "--model", target_model,
              "--port", str(port), "--gpu", str(target_gpu)],
@@ -857,6 +871,89 @@ async def ensure_llm_running(model: str | None = None, gpu: int | None = None):
 # 데이터베이스 초기화
 init_database()
 
+
+def startup_reconcile():
+    """서버 시작 시 status='running' task 중 실제 프로세스가 없는 것을 failed로 마킹.
+    살아있는 orphan은 GPU 풀에 재등록해 pool 일관성 유지."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT task_id, name, work_dir, gpu_id FROM tasks WHERE status='running'"
+        ).fetchall()
+    if not rows:
+        return
+    orphans = []
+    survived = []
+    for tid, name, work_dir, gpu_id in rows:
+        alive = False
+        if work_dir:
+            try:
+                r = subprocess.run(
+                    ["pgrep", "-f", work_dir],
+                    capture_output=True, text=True, timeout=5,
+                )
+                alive = r.returncode == 0 and r.stdout.strip() != ""
+            except Exception as e:
+                print(f"[startup_reconcile] pgrep failed for {tid[:8]}: {e}")
+        if alive:
+            survived.append((tid, gpu_id))
+            if gpu_id is not None:
+                gpu_pool._busy[gpu_id] = tid
+        else:
+            orphans.append((tid, name, "no work_dir" if not work_dir else "no live process"))
+    if orphans:
+        now = datetime.now().isoformat()
+        with get_db() as conn:
+            for tid, name, reason in orphans:
+                conn.execute(
+                    "UPDATE tasks SET status='failed', completed_at=?, "
+                    "error=COALESCE(error,'')||' [startup reconcile: '||?||']' "
+                    "WHERE task_id=?",
+                    (now, reason, tid),
+                )
+    print(f"[startup_reconcile] reviewed={len(rows)} orphans={len(orphans)} survived={len(survived)}")
+
+
+startup_reconcile()
+
+
+INFERENCE_LOG_RETENTION_DAYS = int(os.environ.get("VRUNGPU_INFERENCE_LOG_RETENTION_DAYS", "30"))
+
+
+def _open_inference_log(gpu_id: int):
+    """Timestamp된 inference_server 로그 파일 생성 + 심볼릭 링크 갱신 + 오래된 로그 프루닝.
+
+    inference_server_gpu{N}.log 는 최신 파일을 가리키는 symlink이므로 기존 read 코드 호환.
+    반환: (log_file_handle, log_path)
+    """
+    log_dir = Path("data/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = log_dir / f"inference_server_gpu{gpu_id}-{ts}.log"
+    current_link = log_dir / f"inference_server_gpu{gpu_id}.log"
+
+    # 오래된 로그 프루닝
+    try:
+        cutoff = datetime.now().timestamp() - INFERENCE_LOG_RETENTION_DAYS * 86400
+        for old in log_dir.glob(f"inference_server_gpu{gpu_id}-*.log"):
+            try:
+                if old.stat().st_mtime < cutoff:
+                    old.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 심볼릭 링크 갱신
+    try:
+        if current_link.is_symlink() or current_link.exists():
+            current_link.unlink()
+        current_link.symlink_to(log_path.name)
+    except Exception as e:
+        print(f"[inference log] symlink update failed for gpu{gpu_id}: {e}")
+
+    return open(log_path, "w"), log_path
+
+
 app = FastAPI(
     title="VrunGPU",
     description="원격 GPU 학습/추론 실행 서버 (SQLite 영구 저장 + 모델 관리 + LLM Chat)",
@@ -870,6 +967,65 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ============================================================================
+# API Token Authentication (opt-in via VRUNGPU_API_TOKEN env var)
+# ============================================================================
+
+VRUNGPU_API_TOKEN = os.environ.get("VRUNGPU_API_TOKEN", "").strip()
+
+# 인증 없이 접근 가능한 경로 (read-only + 모니터링). 나머지 write/exec 엔드포인트는 토큰 필요.
+_PUBLIC_PATH_PREFIXES = (
+    "/docs", "/redoc", "/openapi.json", "/ws",
+)
+_PUBLIC_PATHS_EXACT = {
+    "/", "/help", "/pool", "/gpu", "/gpu/pool", "/stats",
+    "/models", "/uploads", "/tasks",
+    "/llm/status", "/llm/sessions",
+}
+
+
+def _is_public_path(method: str, path: str) -> bool:
+    if method == "GET" or method == "OPTIONS":
+        # 모든 GET/OPTIONS는 공개 (조회/CORS preflight).
+        # write는 POST/PUT/DELETE이므로 자연스럽게 분리됨.
+        return True
+    if path in _PUBLIC_PATHS_EXACT:
+        return True
+    for pfx in _PUBLIC_PATH_PREFIXES:
+        if path.startswith(pfx):
+            return True
+    return False
+
+
+@app.middleware("http")
+async def api_token_auth(request, call_next):
+    """VRUNGPU_API_TOKEN이 설정돼 있으면 non-public 경로에 토큰 검증."""
+    if not VRUNGPU_API_TOKEN:
+        return await call_next(request)
+    if _is_public_path(request.method, request.url.path):
+        return await call_next(request)
+    # 검증: Authorization: Bearer <t> 또는 X-API-Token: <t>
+    provided = ""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        provided = auth[7:].strip()
+    if not provided:
+        provided = request.headers.get("x-api-token", "").strip()
+    if provided != VRUNGPU_API_TOKEN:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "인증 토큰이 필요합니다. Authorization: Bearer <token> 또는 X-API-Token 헤더를 포함하세요."},
+        )
+    return await call_next(request)
+
+
+if VRUNGPU_API_TOKEN:
+    print(f"[auth] API token authentication ENABLED (write endpoints require token)")
+else:
+    print(f"[auth] API token authentication DISABLED (set VRUNGPU_API_TOKEN env to enable)")
 
 
 # ============================================================================
@@ -928,7 +1084,12 @@ async def broadcast_task_update(task: TaskResult):
 
 
 async def broadcast_gpu_update():
-    """GPU + CPU 풀 상태 업데이트 브로드캐스트. (이름은 하위 호환을 위해 유지)"""
+    """GPU + CPU 풀 상태 업데이트 브로드캐스트. (이름은 하위 호환을 위해 유지)
+
+    WebSocket 클라이언트가 없으면 nvidia-smi 호출도 스킵 → nv_queue 부하 절감.
+    """
+    if not websocket_clients:
+        return
     gpu_info = get_gpu_info()
     pool_status = gpu_pool.get_status()
     await broadcast({
@@ -1342,6 +1503,42 @@ async def get_usage_help():
                     "vram": "~32GB (BF16 dequantized)",
                     "quantization": "MXFP4 원본 → CPU dequantize → BF16 (V100 호환)",
                     "note": "OpenAI GPT-OSS 20B - Apache 2.0. compute < 7.5 GPU는 CPU에서 MXFP4→BF16 변환 후 GPU 로딩"
+                },
+                {
+                    "name": "meta-llama/Llama-Guard-3-8B",
+                    "alias": "llama-guard-3-8b",
+                    "size": "8B",
+                    "vram": "~16GB (fp16)",
+                    "quantization": "불필요",
+                    "note": "Safety classifier. 응답 형식: 'safe' | 'unsafe\\nS1..S13'. 대화형 챗 아님",
+                    "type": "safety-guard"
+                },
+                {
+                    "name": "google/shieldgemma-2b",
+                    "alias": "shieldgemma-2b",
+                    "size": "2B",
+                    "vram": "~5GB (fp16)",
+                    "quantization": "불필요",
+                    "note": "정책 프롬프트 기반 Yes/No 안전 판정. 특정 harm policy 프롬프트 필요",
+                    "type": "safety-guard"
+                },
+                {
+                    "name": "ibm-granite/granite-guardian-3.1-2b",
+                    "alias": "granite-guardian-2b",
+                    "size": "2B",
+                    "vram": "~5GB (fp16)",
+                    "quantization": "불필요",
+                    "note": "harm / social_bias / jailbreak 등 리스크 태그 판정",
+                    "type": "safety-guard"
+                },
+                {
+                    "name": "ibm-granite/granite-guardian-3.1-8b",
+                    "alias": "granite-guardian-8b",
+                    "size": "8B",
+                    "vram": "~16GB (fp16)",
+                    "quantization": "불필요",
+                    "note": "harm / social_bias / jailbreak 등 리스크 태그 판정 (large)",
+                    "type": "safety-guard"
                 }
             ]
         },
@@ -1661,7 +1858,8 @@ curl "http://{SERVER_IP}:9825/task/{TASK_ID}/files/log/LightGCN/train.log?tail=5
         "notes": [
             "Multi-GPU LLM: GPU별 독립 인스턴스 (port=9826+gpu_id). 동일/다른 모델 동시 서빙 가능",
             "기본 모델: Qwen3.5-9B (model 파라미터 없이 /llm/chat 호출 시 GPU 0에서 자동 시작)",
-            "모델 alias: qwen3.5-9b, qwen2.5-7b, qwen2.5-vl-7b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b 등",
+            "모델 alias: qwen3.5-9b, qwen2.5-7b, qwen2.5-vl-7b, qwen3-8b, deepseek-7b, deepseek-14b, gpt-oss-20b, llama-guard-3-8b, shieldgemma-2b, granite-guardian-2b, granite-guardian-8b 등",
+            "Safety Guard 모델: llama-guard-3-8b / shieldgemma-2b / granite-guardian-2b·8b. /llm/chat로 호출 가능하나 응답 형식이 대화형이 아님 (safety label). 각 모델 카드의 prompt 형식 참조",
             "?gpu=N 파라미터: /llm/chat, /llm/generate, /llm/stop, /llm/sessions에서 인스턴스 지정. 생략 시 자동 라우팅",
             "Vision-Language: qwen2.5-vl-7b는 /llm/chat 미지원, /run/async로 직접 사용 (api_examples.vision_language 참조)",
             "파인튜닝: SFT (/llm/finetune) + DPO (/llm/finetune/dpo). PEFT fp16 LoRA, V100 호환",
@@ -2667,8 +2865,7 @@ async def start_llm_service(
         cmd.extend(["--ei-checkpoint", ei_checkpoint])
 
     log_dir = Path("data/logs")
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_dir / f"inference_server_gpu{assigned_gpu}.log", "w")
+    log_file, _log_path = _open_inference_log(assigned_gpu)
     process = subprocess.Popen(
         cmd,
         stdout=log_file,
@@ -2763,17 +2960,22 @@ async def get_llm_status():
     )
 
 
+def _coerce_sampling(payload: dict) -> dict:
+    """temperature <= 0 이면 do_sample=False로 자동 보정 (transformers 500 방지)."""
+    if payload.get("temperature", 1.0) <= 0.0 and payload.get("do_sample", False):
+        payload["do_sample"] = False
+    return payload
+
+
 @app.post("/llm/generate")
 async def llm_generate(request: LLMGenerateRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
     """LLM 텍스트 생성 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
     inst = await ensure_llm_running(gpu=gpu)
+    payload = _coerce_sampling(request.model_dump())
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                f"{inst.url}/generate",
-                json=request.model_dump(),
-            )
+            resp = await client.post(f"{inst.url}/generate", json=payload)
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             return resp.json()
@@ -2787,13 +2989,11 @@ async def llm_generate(request: LLMGenerateRequest, gpu: int | None = Query(defa
 async def llm_chat(request: LLMChatRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
     """LLM 채팅 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
     inst = await ensure_llm_running(gpu=gpu)
+    payload = _coerce_sampling(request.model_dump())
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
-            resp = await client.post(
-                f"{inst.url}/chat",
-                json=request.model_dump(),
-            )
+            resp = await client.post(f"{inst.url}/chat", json=payload)
             if resp.status_code != 200:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             return resp.json()

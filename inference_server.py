@@ -36,6 +36,35 @@ except Exception:
     pass
 
 # ============================================================================
+# E-I RiskGate module (must match training exactly for train/infer parity).
+# Older checkpoints store a hand-converted, lossy gate (context_proj collapsed to
+# a bare Linear); those still use the legacy hand-coded path in compute_ei_gates.
+# Checkpoints saved in raw module format ({L}.risk_gate.gate_net.*) are run through
+# this module so inference math is identical to training.
+# ============================================================================
+import torch.nn as _nn
+
+
+class RiskGate(_nn.Module):
+    def __init__(self, hidden_dim, gate_hidden=256, dropout=0.1, use_context=True):
+        super().__init__()
+        self.gate_hidden = gate_hidden
+        self.use_context = use_context
+        ctx = gate_hidden if use_context else 0
+        self.context_proj = (_nn.Sequential(_nn.Linear(hidden_dim, gate_hidden),
+                             _nn.LayerNorm(gate_hidden), _nn.GELU()) if use_context else None)
+        self.gate_net = _nn.Sequential(
+            _nn.Linear(hidden_dim + ctx, gate_hidden), _nn.LayerNorm(gate_hidden),
+            _nn.GELU(), _nn.Dropout(dropout), _nn.Linear(gate_hidden, 1), _nn.Sigmoid())
+
+    def forward(self, h, prev=None):
+        if self.use_context:
+            ctx = self.context_proj(h)
+            return self.gate_net(torch.cat([h, ctx], -1)), ctx
+        return self.gate_net(h), None
+
+
+# ============================================================================
 # Configuration
 # ============================================================================
 
@@ -54,6 +83,8 @@ class GenerateRequest(BaseModel):
     top_k: int = Field(default=50, ge=0, description="Top-k 샘플링")
     do_sample: bool = Field(default=False, description="샘플링 사용 여부 (GPU 호환성 문제로 기본값 False)")
     system_prompt: Optional[str] = Field(default=None, description="시스템 프롬프트")
+    raw_prompt: bool = Field(default=False, description="True면 chat template 없이 prompt를 그대로 사용 (guard 모델 등 커스텀 프롬프트 형식용)")
+    template_kwargs: dict | None = Field(default=None, description="apply_chat_template에 전달할 추가 인자 (예: guideline, guardian_config)")
 
 
 class ChatMessage(BaseModel):
@@ -72,6 +103,7 @@ class ChatRequest(BaseModel):
     do_sample: bool = Field(default=False)
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
     ei_gate: bool = Field(default=False, description="E-I gate computation")
+    template_kwargs: dict | None = Field(default=None, description="apply_chat_template에 전달할 추가 인자 (예: guideline, guardian_config)")
 
 
 class GenerateResponse(BaseModel):
@@ -205,6 +237,9 @@ def load_ei_gates(checkpoint_dir: str):
 
     ei_layers = cfg.get("ei_enabled_layers", [])
     risk_gate_hidden = cfg.get("risk_gate_hidden", 256)
+    hidden_dim = cfg.get("hidden_dim", 3584)
+    use_context = cfg.get("use_cross_layer_context", True)
+    pooling = cfg.get("pooling", "mean")   # "last_token" for Stage-1 winner; legacy default "mean"
 
     st_path = os.path.join(checkpoint_dir, "ei_gates_only.safetensors")
     if not os.path.exists(st_path):
@@ -234,11 +269,30 @@ def load_ei_gates(checkpoint_dir: str):
                 except (ValueError, IndexError):
                     pass
 
+    # Build RiskGate modules when the checkpoint is in raw module format
+    # (keys like risk_gate.gate_net.0.weight). Legacy converted checkpoints use
+    # risk_gate.gate_mlp.* and fall back to the hand-coded path.
+    modules = {}
+    is_module_format = any("risk_gate.gate_net." in k for w in gate_weights.values() for k in w)
+    if is_module_format:
+        for li, w in gate_weights.items():
+            has_ctx = any("context_proj" in k for k in w)
+            sd = {k[len("risk_gate."):]: v.float() for k, v in w.items() if k.startswith("risk_gate.")}
+            gate = RiskGate(hidden_dim, risk_gate_hidden, dropout=0.0, use_context=has_ctx)
+            missing, unexpected = gate.load_state_dict(sd, strict=False)
+            if missing or unexpected:
+                print(f"[E-I] layer {li} state_dict mismatch missing={missing} unexpected={unexpected}")
+            gate.eval()
+            modules[li] = gate
+        print(f"[E-I] Built {len(modules)} RiskGate modules (module-parity path, pooling={pooling})")
+
     ei_gate_weights = {
         "weights": gate_weights,
+        "modules": modules,
         "layers": ei_layers,
         "risk_gate_hidden": risk_gate_hidden,
         "alpha_values": alpha_key_map,
+        "pooling": pooling,
     }
     total_params = sum(sum(t.numel() for t in w.values()) for w in gate_weights.values())
     print(f"[E-I] Gates loaded to CPU: {len(gate_weights)} layers, {total_params:,} params, hidden={risk_gate_hidden}")
@@ -255,22 +309,33 @@ def compute_ei_gates(input_text: str):
     ei_layers = ei_gate_weights["layers"]
     weights = ei_gate_weights["weights"]
     rgh = ei_gate_weights["risk_gate_hidden"]
+    pooling = ei_gate_weights.get("pooling", "mean")
 
     inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=512)
     display_tokens = [tokenizer.decode([t]) for t in inputs["input_ids"][0]]
 
+    # Pooling reduces token-level hidden states to one vector per layer.
+    #   last_token (Stage-1 winner): hook the decoder LAYER OUTPUT and take the
+    #     final token — matches training extraction (layers[L] out[:, -1, :]).
+    #   mean (legacy V2): hook the MLP input and mean-pool — kept for back-compat
+    #     so existing checkpoints without a "pooling" field behave unchanged.
+    last_token = (pooling == "last_token")
     captured = {}
     hooks = []
     for li in ei_layers:
         def make_hook(layer_idx):
             def fn(module, inp, out):
-                h = inp[0] if isinstance(inp, tuple) else inp
-                captured[layer_idx] = h.mean(dim=1).detach().cpu()
+                if last_token:
+                    h = out[0] if isinstance(out, tuple) else out
+                    captured[layer_idx] = h[:, -1, :].detach().cpu()   # last token, no padding at inference
+                else:
+                    h = inp[0] if isinstance(inp, tuple) else inp
+                    captured[layer_idx] = h.mean(dim=1).detach().cpu()
                 return out
             return fn
         try:
-            layer = model.model.layers[li].mlp
-            hooks.append(layer.register_forward_hook(make_hook(li)))
+            module = model.model.layers[li] if last_token else model.model.layers[li].mlp
+            hooks.append(module.register_forward_hook(make_hook(li)))
         except (AttributeError, IndexError) as e:
             print(f"[E-I] Hook error layer {li}: {e}")
 
@@ -281,11 +346,24 @@ def compute_ei_gates(input_text: str):
     for h in hooks:
         h.remove()
 
+    modules = ei_gate_weights.get("modules") or {}
     gate_list, alpha_list = [], []
     risk_ctx = None
     for li in ei_layers:
-        if li not in weights or li not in captured:
+        if li not in captured:
             continue
+        # Module-parity path: run the trained RiskGate exactly as in training.
+        if li in modules:
+            h = captured[li].float()          # [1, H]
+            with torch.no_grad():
+                g, _ = modules[li](h)
+            gate_list.append(round(g[0, 0].item(), 4))
+            av = ei_gate_weights.get("alpha_values", {})
+            alpha_list.append(round(av[li].item(), 4) if li in av else 0.15)
+            continue
+        if li not in weights:
+            continue
+        # Legacy hand-coded path (unchanged) for converted V2-style checkpoints.
         h = captured[li]
         w = weights[li]
         has_ln = "risk_gate.gate_mlp.1.weight" in w
@@ -584,21 +662,26 @@ async def generate(request: GenerateRequest):
 
     start_time = datetime.now()
 
-    # 프롬프트 구성 - chat template 사용
-    if request.system_prompt:
-        messages = [
-            {"role": "system", "content": request.system_prompt},
-            {"role": "user", "content": request.prompt}
-        ]
+    if request.raw_prompt:
+        # chat template 우회 — prompt를 그대로 사용 (guard 모델의 커스텀 프롬프트 형식용)
+        full_prompt = request.prompt
     else:
-        messages = [{"role": "user", "content": request.prompt}]
+        # 프롬프트 구성 - chat template 사용
+        if request.system_prompt:
+            messages = [
+                {"role": "system", "content": request.system_prompt},
+                {"role": "user", "content": request.prompt}
+            ]
+        else:
+            messages = [{"role": "user", "content": request.prompt}]
 
-    # apply_chat_template 사용
-    full_prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+        template_kwargs = request.template_kwargs or {}
+        full_prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **template_kwargs,
+        )
 
     # 토크나이즈 (attention_mask 포함)
     inputs = tokenizer(full_prompt, return_tensors="pt", return_attention_mask=True).to(device)
@@ -670,10 +753,12 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="message 또는 messages 중 하나는 필수입니다.")
 
     # apply_chat_template 사용
+    template_kwargs = request.template_kwargs or {}
     full_prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
-        add_generation_prompt=True
+        add_generation_prompt=True,
+        **template_kwargs,
     )
 
     # 토크나이즈 (attention_mask 포함)

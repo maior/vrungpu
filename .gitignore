@@ -57,3 +57,13 @@ data/
 .env
 .env.local
 .env.*.local
+
+# Backup files (safety copies from ad-hoc edits — git already tracks history)
+*.bak
+
+# Compiled / cached artifacts
+unsloth_compiled_cache/
+
+# Experiment outputs (E-I gate research)
+ei_results/
+ei_eval_results/
