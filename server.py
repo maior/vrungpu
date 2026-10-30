@@ -53,8 +53,10 @@ DB_PATH = BASE_DIR / "vrungpu.db"
 LLM_SERVER_SCRIPT = Path(__file__).parent / "inference_server.py"
 LLM_SERVER_PORT = 9826
 LLM_SERVER_URL = f"http://localhost:{LLM_SERVER_PORT}"
-DEFAULT_LLM_MODEL = "Qwen/Qwen3.5-9B"
+DEFAULT_LLM_MODEL = os.environ.get("VRUNGPU_DEFAULT_LLM_MODEL", "ollama:qwen3.8:27b")
 DEFAULT_LLM_GPU = 0  # LLM 기본 GPU (gpu_pool과 연동하여 충돌 방지)
+# LLM API 호출 시 실행 중인 인스턴스가 없으면 기본 모델을 자동 시작할지 (기본: 안 함, /llm/start 로 명시적 시작)
+LLM_AUTOSTART = os.environ.get("VRUNGPU_LLM_AUTOSTART", "0") == "1"
 LLM_STARTUP_TIMEOUT = 120  # LLM 서버 시작 대기 시간 (초)
 
 # 모델 alias → 실제 경로 매핑 (짧은 이름으로 호출 가능)
@@ -806,8 +808,8 @@ async def ensure_llm_stopped(gpu_id: int | None = None):
 
 
 async def ensure_llm_running(model: str | None = None, gpu: int | None = None):
-    """LLM API 호출 전 LLM 서비스 자동 시작.
-    이미 살아 있는 인스턴스가 있으면 그것을 반환."""
+    """LLM API 호출 전 실행 중인 인스턴스 확보.
+    이미 살아 있는 인스턴스가 있으면 그것을 반환. 없으면 LLM_AUTOSTART 일 때만 기본 모델 자동 시작, 아니면 503."""
 
     async with llm_switching_lock:
         # 이미 실행 중인 인스턴스가 있으면 재활용
@@ -825,6 +827,14 @@ async def ensure_llm_running(model: str | None = None, gpu: int | None = None):
                 llm_instances.pop(gid)
 
         target_model = resolve_model_name(model or DEFAULT_LLM_MODEL)
+        if not LLM_AUTOSTART:
+            raise HTTPException(status_code=503, detail=f"실행 중인 LLM 인스턴스가 없습니다. 먼저 POST /llm/start 로 모델을 띄우세요 (기본 모델: {target_model}).")
+        if is_ollama_model(target_model):
+            target_gpu = gpu if gpu is not None else OLLAMA_GPU
+            print(f"[Auto-Switch] LLM 시작: {target_model} on GPU {target_gpu} (Ollama)")
+            await _start_ollama_instance(target_model, target_gpu)
+            return llm_instances[target_gpu]
+
         target_gpu = gpu if gpu is not None else DEFAULT_LLM_GPU
         port = _llm_port(target_gpu)
         task_id = _llm_task_id(target_gpu)
@@ -2848,8 +2858,8 @@ async def _start_ollama_instance(model: str, gpu: int) -> LLMServiceStatus:
 
 @app.post("/llm/start", response_model=LLMServiceStatus)
 async def start_llm_service(
-    model: str = Query(default=DEFAULT_LLM_MODEL, description="HuggingFace 모델 이름"),
-    gpu: int = Query(default=DEFAULT_LLM_GPU, description="사용할 GPU ID"),
+    model: str = Query(default=DEFAULT_LLM_MODEL, description="HuggingFace 모델 이름 또는 ollama:<모델>"),
+    gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 Ollama 모델은 Ollama GPU, 그 외는 DEFAULT_LLM_GPU)"),
     load_in_4bit: bool = Query(default=False, description="4-bit 양자화 (VRAM 절약, 14B+ 모델 권장)"),
     load_in_8bit: bool = Query(default=False, description="8-bit 양자화"),
     lora_adapter: str | None = Query(default=None, description="LoRA 어댑터 경로 (파인튜닝된 모델)"),
@@ -2858,6 +2868,8 @@ async def start_llm_service(
     """LLM 추론 서버 시작 (GPU별 독립 인스턴스, 동시에 여러 GPU에서 실행 가능)
     model 이 "ollama:" 로 시작하면 Ollama 백엔드를 사용 (예: ollama:qwen3.8:27b)"""
     model = resolve_model_name(model)
+    if gpu is None:
+        gpu = OLLAMA_GPU if is_ollama_model(model) else DEFAULT_LLM_GPU
 
     # 해당 GPU에 이미 인스턴스가 있는지 확인
     existing = llm_instances.get(gpu)
@@ -3012,7 +3024,7 @@ async def _ollama_call(coro):
 
 @app.post("/llm/generate")
 async def llm_generate(request: LLMGenerateRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
-    """LLM 텍스트 생성 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
+    """LLM 텍스트 생성 (실행 중인 인스턴스 필요, VRUNGPU_LLM_AUTOSTART=1 이면 자동 시작). gpu로 인스턴스 지정 가능."""
     inst = await ensure_llm_running(gpu=gpu)
     payload = _coerce_sampling(request.model_dump())
     if inst.is_ollama:
@@ -3032,7 +3044,7 @@ async def llm_generate(request: LLMGenerateRequest, gpu: int | None = Query(defa
 
 @app.post("/llm/chat")
 async def llm_chat(request: LLMChatRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
-    """LLM 채팅 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
+    """LLM 채팅 (실행 중인 인스턴스 필요, VRUNGPU_LLM_AUTOSTART=1 이면 자동 시작). gpu로 인스턴스 지정 가능."""
     inst = await ensure_llm_running(gpu=gpu)
     payload = _coerce_sampling(request.model_dump())
     if inst.is_ollama:

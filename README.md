@@ -502,8 +502,12 @@ curl -X POST "http://your-server:9825/llm/stop?gpu=1"
 - **Sessions**: kept by vrungpu (Ollama is stateless), same format and 4h TTL as `inference_server.py`.
 - **GPU pool**: the Ollama GPU is reserved in the pool while the model is loaded, and training jobs that need that GPU unload it automatically. Clients calling Ollama directly on port 11434 bypass this reservation.
 
+- **No auto-start by default**: `/llm/chat`, `/llm/generate` return `503` when no model is loaded — start one with `/llm/start` first (`/llm/start` with no params loads the default model). Set `VRUNGPU_LLM_AUTOSTART=1` to restore the old behavior of auto-starting the default model on the first call.
+
 | Env var | Default | Meaning |
 |---------|---------|---------|
+| `VRUNGPU_DEFAULT_LLM_MODEL` | `ollama:qwen3.8:27b` | Model used by `/llm/start` with no `model` (and by auto-start) |
+| `VRUNGPU_LLM_AUTOSTART` | `0` | `1` = auto-start the default model when an LLM API is called with nothing loaded |
 | `VRUNGPU_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server |
 | `VRUNGPU_OLLAMA_GPU` | `1` | GPU the Ollama service is pinned to (`CUDA_VISIBLE_DEVICES`) |
 | `VRUNGPU_OLLAMA_NUM_CTX` | `32768` | Context length per request |
