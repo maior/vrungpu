@@ -502,6 +502,23 @@ curl -X POST "http://your-server:9825/llm/stop?gpu=1"
 - **Sessions**: kept by vrungpu (Ollama is stateless), same format and 4h TTL as `inference_server.py`.
 - **GPU pool**: the Ollama GPU is reserved in the pool while the model is loaded, and training jobs that need that GPU unload it automatically. Clients calling Ollama directly on port 11434 bypass this reservation.
 
+#### OpenAI-compatible API (`/v1`) — for agents
+
+Loaded Ollama models are also exposed as an OpenAI-compatible API, relayed as-is to Ollama, so agent frameworks (OpenAI SDK, LangChain, …) work unchanged, including **tool calling** and **streaming**. Only models started via `/llm/start` are accepted (others → `400`, nothing loaded → `503`).
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://your-server:9825/v1", api_key="<VRUNGPU_API_TOKEN or any string if auth is off>")
+r = client.chat.completions.create(
+    model="qwen3.8:27b",
+    messages=[{"role": "user", "content": "What's the weather in Seoul?"}],
+    tools=[...],
+    reasoning_effort="none",   # thinking off — much faster for tool loops
+)
+```
+
+- `GET /v1/models` lists the loaded models; `POST /v1/chat/completions` requires the API token when `VRUNGPU_API_TOKEN` is set (`api_key` is sent as `Authorization: Bearer`).
+
 - **No auto-start by default**: `/llm/chat`, `/llm/generate` return `503` when no model is loaded — start one with `/llm/start` first (`/llm/start` with no params loads the default model). Set `VRUNGPU_LLM_AUTOSTART=1` to restore the old behavior of auto-starting the default model on the first call.
 
 | Env var | Default | Meaning |

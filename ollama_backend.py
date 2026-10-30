@@ -249,6 +249,42 @@ class OllamaInstance:
                                       data.get("prompt_eval_count", 0) + data.get("eval_count", 0))
         return self._response(data, text, msg.get("thinking"), started, sid)
 
+    # ---- OpenAI 호환 (/v1) 중계 ------------------------------------------
+
+    async def openai_chat(self, body: dict) -> tuple[int, dict]:
+        """/v1/chat/completions (stream=false) — 요청/응답을 그대로 중계 (tools 포함)"""
+        try:
+            async with httpx.AsyncClient(timeout=OLLAMA_REQUEST_TIMEOUT) as client:
+                r = await client.post(f"{OLLAMA_URL}/v1/chat/completions", json=body)
+        except httpx.TimeoutException:
+            raise OllamaError(504, "LLM 생성 타임아웃")
+        except httpx.ConnectError:
+            raise OllamaError(503, "Ollama 서버에 연결할 수 없습니다.")
+        return r.status_code, r.json()
+
+    async def openai_stream(self, body: dict):
+        """/v1/chat/completions (stream=true) — 응답 상태를 먼저 확인한 뒤 SSE 바이트를 그대로 중계하는 iterator 반환"""
+        client = httpx.AsyncClient(timeout=OLLAMA_REQUEST_TIMEOUT)
+        try:
+            resp = await client.send(client.build_request("POST", f"{OLLAMA_URL}/v1/chat/completions", json=body), stream=True)
+        except httpx.ConnectError:
+            await client.aclose()
+            raise OllamaError(503, "Ollama 서버에 연결할 수 없습니다.")
+        if resp.status_code != 200:
+            detail = (await resp.aread()).decode(errors="replace")
+            await resp.aclose()
+            await client.aclose()
+            raise OllamaError(resp.status_code, detail)
+
+        async def relay():
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            finally:
+                await resp.aclose()
+                await client.aclose()
+        return relay()
+
     async def generate(self, payload: dict) -> dict:
         """/llm/generate — raw_prompt 면 템플릿 없이, 아니면 system+user 채팅으로"""
         started = time.time()

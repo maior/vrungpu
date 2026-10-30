@@ -31,12 +31,12 @@ from typing import Any
 
 import aiofiles
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, WebSocket, WebSocketDisconnect, Form
+from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile, File, Query, Request, WebSocket, WebSocketDisconnect, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from ollama_backend import OLLAMA_GPU, OllamaError, OllamaInstance, is_ollama_model
+from ollama_backend import OLLAMA_GPU, OllamaError, OllamaInstance, is_ollama_model, strip_prefix
 
 
 # ============================================================================
@@ -3061,6 +3061,48 @@ async def llm_chat(request: LLMChatRequest, gpu: int | None = Query(default=None
         raise HTTPException(status_code=504, detail="LLM 생성 타임아웃")
     except httpx.ConnectError:
         raise HTTPException(status_code=503, detail="LLM 서버에 연결할 수 없습니다.")
+
+
+# ============================================================================
+# API Endpoints - OpenAI 호환 (/v1) — Ollama 백엔드 중계 (tools, stream 지원)
+# ============================================================================
+
+def _loaded_ollama_instance(model: str | None) -> OllamaInstance:
+    """요청 model 에 해당하는 로드된 Ollama 인스턴스. vrungpu가 띄운 모델만 허용 (GPU 예약 우회 방지)"""
+    loaded = [i for i in llm_instances.values() if i.is_ollama and i.alive]
+    if not loaded:
+        raise HTTPException(status_code=503, detail="실행 중인 Ollama 모델이 없습니다. 먼저 POST /llm/start 로 모델을 띄우세요.")
+    if not model:
+        return loaded[0]
+    name = strip_prefix(model)
+    for inst in loaded:
+        if inst.ollama_model == name:
+            return inst
+    raise HTTPException(status_code=400, detail=f"'{model}' 모델은 로드되어 있지 않습니다. 사용 가능: {[i.ollama_model for i in loaded]}")
+
+
+@app.get("/v1/models")
+async def openai_list_models():
+    """OpenAI 호환 모델 목록 (vrungpu가 로드한 Ollama 모델)"""
+    data = [{"id": i.ollama_model, "object": "model", "created": 0, "owned_by": "vrungpu"}
+            for i in llm_instances.values() if i.is_ollama and i.alive]
+    return {"object": "list", "data": data}
+
+
+@app.post("/v1/chat/completions")
+async def openai_chat_completions(request: Request):
+    """OpenAI 호환 chat completions — 요청을 Ollama /v1 로 그대로 중계 (tools, stream, reasoning_effort 등)"""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="JSON 본문이 필요합니다.")
+    inst = _loaded_ollama_instance(body.get("model"))
+    body["model"] = inst.ollama_model
+    if body.get("stream"):
+        relay = await _ollama_call(inst.openai_stream(body))
+        return StreamingResponse(relay, media_type="text/event-stream")
+    status, data = await _ollama_call(inst.openai_chat(body))
+    return JSONResponse(status_code=status, content=data)
 
 
 # ============================================================================
