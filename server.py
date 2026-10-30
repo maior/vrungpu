@@ -788,23 +788,22 @@ def _stop_llm_instance(inst: LLMInstance):
 
 
 async def ensure_llm_stopped(gpu_id: int | None = None):
-    """VrunGPU 작업 전 LLM 서비스 중지 (GPU 확보).
-    gpu_id 지정 시 해당 GPU만, None이면 전체 인스턴스 중지."""
+    """VrunGPU 작업 전, 작업이 쓸 GPU를 LLM이 점유하고 있을 때만 그 인스턴스를 중지.
+    gpu_id 지정 시 해당 GPU의 인스턴스만 중지.
+    None(아무 GPU)이면 빈 GPU가 있으면 아무것도 중지하지 않고, 없을 때만 LLM 인스턴스 하나를 중지."""
 
     async with llm_switching_lock:
-        stopped = False
         if gpu_id is not None:
             inst = llm_instances.get(gpu_id)
-            if inst:
-                _stop_llm_instance(inst)
-                stopped = True
+        elif gpu_pool.get_status()["available_gpus"]:
+            inst = None  # 빈 GPU에서 실행되므로 LLM 유지
         else:
-            for gid in list(llm_instances):
-                _stop_llm_instance(llm_instances[gid])
-                stopped = True
-        if stopped:
-            await asyncio.sleep(1)  # GPU 메모리 해제 대기
-        return stopped
+            inst = next(iter(llm_instances.values()), None)
+        if inst is None:
+            return False
+        _stop_llm_instance(inst)
+        await asyncio.sleep(1)  # GPU 메모리 해제 대기
+        return True
 
 
 async def ensure_llm_running(model: str | None = None, gpu: int | None = None):
@@ -1926,7 +1925,7 @@ async def run_sync(request: CodeRequest):
 
     # GPU 확보를 위해 LLM 서비스 자동 중지 (GPU 경로만)
     if device == "gpu":
-        await ensure_llm_stopped()
+        await ensure_llm_stopped(request.gpu_id)
 
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
@@ -2003,8 +2002,9 @@ async def run_sync(request: CodeRequest):
 @app.post("/run/async", response_model=AsyncTaskResponse)
 async def run_async(request: CodeRequest, background_tasks: BackgroundTasks):
     """비동기 실행 (즉시 반환, 백그라운드 실행, LLM 자동 중지)"""
-    # GPU 확보를 위해 LLM 서비스 자동 중지
-    await ensure_llm_stopped()
+    # 작업이 쓸 GPU를 LLM이 점유 중이면 그 인스턴스만 중지
+    if (request.device or "gpu").lower() == "gpu":
+        await ensure_llm_stopped(request.gpu_id)
 
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
@@ -2056,8 +2056,9 @@ async def run_project(
     background_tasks: BackgroundTasks = None,
 ):
     """프로젝트 업로드 후 실행 (스트리밍 업로드, LLM 자동 중지)"""
-    # GPU 확보를 위해 LLM 서비스 자동 중지
-    await ensure_llm_stopped()
+    # 작업이 쓸 GPU를 LLM이 점유 중이면 그 인스턴스만 중지
+    if (device or "gpu").lower() == "gpu":
+        await ensure_llm_stopped(gpu_id)
 
     task_id = str(uuid.uuid4())
     work_dir = WORKSPACES_DIR / task_id
