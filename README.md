@@ -476,6 +476,40 @@ print(r.json()["generated_text"])
 requests.post(f"{SERVER}/llm/stop")
 ```
 
+### Ollama Backend
+
+Prefix the model name with `ollama:` to serve a model through a local [Ollama](https://ollama.com) server instead of `inference_server.py`. This is the fast path for large quantized models (e.g. Qwen3.8-27B Q4 at ~60 tok/s on one V100S) that do not fit in FP16.
+
+```bash
+# Pull the model into Ollama first
+ollama pull qwen3.8:27b
+
+# Load it on the GPU Ollama is pinned to (VRUNGPU_OLLAMA_GPU, default 1)
+curl -X POST "http://your-server:9825/llm/start?model=ollama:qwen3.8:27b&gpu=1"
+
+# Same /llm/chat, /llm/generate and session APIs as before
+curl -X POST "http://your-server:9825/llm/chat?gpu=1" \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Write a C function that parses a fixed-length record"}],
+       "max_new_tokens": 4096, "think": false}'
+
+# Unload the model from the GPU and release it to the pool
+curl -X POST "http://your-server:9825/llm/stop?gpu=1"
+```
+
+- **`think`**: `true`/`false` turns thinking mode on/off for thinking models; omit it to use the model default. The reasoning is returned in a separate `thinking` field. Thinking tokens count against `max_new_tokens`, so raise it (e.g. 8192+) when thinking is on — an empty answer comes back with `done_reason: "length"` and a `warning`.
+- **Sampling**: `temperature`, `top_p`, `top_k` are passed through; `do_sample: false` means greedy (temperature 0). `template_kwargs` is not supported.
+- **Sessions**: kept by vrungpu (Ollama is stateless), same format and 4h TTL as `inference_server.py`.
+- **GPU pool**: the Ollama GPU is reserved in the pool while the model is loaded, and training jobs that need that GPU unload it automatically. Clients calling Ollama directly on port 11434 bypass this reservation.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `VRUNGPU_OLLAMA_URL` | `http://127.0.0.1:11434` | Ollama server |
+| `VRUNGPU_OLLAMA_GPU` | `1` | GPU the Ollama service is pinned to (`CUDA_VISIBLE_DEVICES`) |
+| `VRUNGPU_OLLAMA_NUM_CTX` | `32768` | Context length per request |
+| `VRUNGPU_OLLAMA_TIMEOUT` | `1800` | Per-request timeout (s); thinking answers can take minutes |
+| `VRUNGPU_OLLAMA_LOAD_TIMEOUT` | `600` | Model load timeout (s) |
+
 ---
 
 ## File Upload API

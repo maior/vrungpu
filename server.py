@@ -36,6 +36,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from ollama_backend import OLLAMA_GPU, OllamaError, OllamaInstance, is_ollama_model
+
 
 # ============================================================================
 # Configuration
@@ -301,6 +303,7 @@ class LLMGenerateRequest(BaseModel):
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트")
     raw_prompt: bool = Field(default=False, description="True면 chat template 없이 prompt를 그대로 사용 (guard 모델 등)")
     template_kwargs: dict | None = Field(default=None, description="apply_chat_template에 전달할 추가 인자 (예: guideline, guardian_config)")
+    think: bool | None = Field(default=None, description="(Ollama 백엔드) thinking 모드 on/off. None이면 모델 기본값")
 
 
 class LLMChatMessage(BaseModel):
@@ -320,6 +323,7 @@ class LLMChatRequest(BaseModel):
     system_prompt: str | None = Field(default=None, description="시스템 프롬프트 (세션 생성 시 설정)")
     ei_gate: bool = Field(default=False, description="E-I gate computation")
     template_kwargs: dict | None = Field(default=None, description="apply_chat_template에 전달할 추가 인자 (예: guideline, guardian_config)")
+    think: bool | None = Field(default=None, description="(Ollama 백엔드) thinking 모드 on/off. None이면 모델 기본값")
 
 
 class LLMInstanceInfo(BaseModel):
@@ -720,6 +724,7 @@ LLM_BASE_PORT = LLM_SERVER_PORT  # 9826
 class LLMInstance:
     """GPU 한 대에 매핑된 inference_server.py 프로세스"""
     __slots__ = ("process", "model_name", "gpu_id", "port")
+    is_ollama = False
 
     def __init__(self, process: subprocess.Popen, model_name: str, gpu_id: int, port: int):
         self.process = process
@@ -736,7 +741,7 @@ class LLMInstance:
         return f"http://localhost:{self.port}"
 
 
-llm_instances: dict[int, LLMInstance] = {}  # gpu_id → LLMInstance
+llm_instances: dict[int, LLMInstance | OllamaInstance] = {}  # gpu_id → 인스턴스
 llm_switching_lock = asyncio.Lock()
 
 
@@ -766,7 +771,9 @@ LLM_TASK_ID = "__llm_inference__"  # 하위 호환용 (기존 gpu_pool 기록)
 
 def _stop_llm_instance(inst: LLMInstance):
     """LLM 인스턴스 프로세스 종료 + GPU 반환 (동기, lock 밖에서 호출 가능)"""
-    if inst.alive:
+    if inst.is_ollama:
+        inst.unload()
+    elif inst.alive:
         inst.process.terminate()
         try:
             inst.process.wait(timeout=10)
@@ -2818,6 +2825,27 @@ async def get_statistics():
 # API Endpoints - LLM Service
 # ============================================================================
 
+async def _start_ollama_instance(model: str, gpu: int) -> LLMServiceStatus:
+    """Ollama 백엔드 인스턴스 등록: GPU 예약 → 모델 로드(상주)"""
+    if gpu != OLLAMA_GPU:
+        raise HTTPException(status_code=400, detail=f"Ollama 서비스는 GPU {OLLAMA_GPU}에 고정되어 있습니다. gpu={OLLAMA_GPU} 로 요청하세요.")
+
+    if gpu_pool.acquire(_llm_task_id(gpu), gpu) is None:
+        raise HTTPException(status_code=409, detail=f"GPU {gpu}이(가) 사용 중입니다.")
+
+    inst = OllamaInstance(model, gpu)
+    try:
+        await inst.load()
+    except OllamaError as e:
+        gpu_pool.release(gpu)
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+    llm_instances[gpu] = inst
+    print(f"[LLM] GPU {gpu} 예약 (Ollama {inst.url}), 모델: {model}")
+    info = LLMInstanceInfo(gpu_id=gpu, model=model, port=inst.port, pid=None, running=True)
+    return LLMServiceStatus(running=True, model=model, port=inst.port, pid=None, instances=[info])
+
+
 @app.post("/llm/start", response_model=LLMServiceStatus)
 async def start_llm_service(
     model: str = Query(default=DEFAULT_LLM_MODEL, description="HuggingFace 모델 이름"),
@@ -2827,13 +2855,17 @@ async def start_llm_service(
     lora_adapter: str | None = Query(default=None, description="LoRA 어댑터 경로 (파인튜닝된 모델)"),
     ei_checkpoint: str = Query(default=None, description="E-I gate checkpoint directory"),
 ):
-    """LLM 추론 서버 시작 (GPU별 독립 인스턴스, 동시에 여러 GPU에서 실행 가능)"""
+    """LLM 추론 서버 시작 (GPU별 독립 인스턴스, 동시에 여러 GPU에서 실행 가능)
+    model 이 "ollama:" 로 시작하면 Ollama 백엔드를 사용 (예: ollama:qwen3.8:27b)"""
     model = resolve_model_name(model)
 
     # 해당 GPU에 이미 인스턴스가 있는지 확인
     existing = llm_instances.get(gpu)
     if existing and existing.alive:
         raise HTTPException(status_code=400, detail=f"GPU {gpu}에 이미 LLM 인스턴스가 실행 중입니다 (model={existing.model_name}, port={existing.port}). 먼저 /llm/stop?gpu={gpu} 으로 중지하세요.")
+
+    if is_ollama_model(model):
+        return await _start_ollama_instance(model, gpu)
 
     if not LLM_SERVER_SCRIPT.exists():
         raise HTTPException(status_code=500, detail="inference_server.py 파일을 찾을 수 없습니다.")
@@ -2929,7 +2961,10 @@ async def get_llm_status():
     for inst in llm_instances.values():
         alive = inst.alive
         model = inst.model_name
-        if alive:
+        if inst.is_ollama:
+            # Ollama 측에서 모델이 내려갔으면(외부 unload, 서비스 재시작) running=False
+            alive = alive and await inst.health()
+        elif alive:
             try:
                 async with httpx.AsyncClient(timeout=10.0) as client:
                     resp = await client.get(f"{inst.url}/health")
@@ -2945,7 +2980,7 @@ async def get_llm_status():
                 alive = False
         instance_infos.append(LLMInstanceInfo(
             gpu_id=inst.gpu_id, model=model, port=inst.port,
-            pid=inst.process.pid if inst.alive else None, running=alive,
+            pid=inst.process.pid if inst.process is not None and inst.alive else None, running=alive,
         ))
 
     any_running = any(i.running for i in instance_infos)
@@ -2967,11 +3002,21 @@ def _coerce_sampling(payload: dict) -> dict:
     return payload
 
 
+async def _ollama_call(coro):
+    """Ollama 백엔드 호출 — OllamaError 를 HTTPException 으로 변환"""
+    try:
+        return await coro
+    except OllamaError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
+
+
 @app.post("/llm/generate")
 async def llm_generate(request: LLMGenerateRequest, gpu: int | None = Query(default=None, description="사용할 GPU ID (미지정 시 아무 인스턴스)")):
     """LLM 텍스트 생성 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
     inst = await ensure_llm_running(gpu=gpu)
     payload = _coerce_sampling(request.model_dump())
+    if inst.is_ollama:
+        return await _ollama_call(inst.generate(payload))
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
@@ -2990,6 +3035,8 @@ async def llm_chat(request: LLMChatRequest, gpu: int | None = Query(default=None
     """LLM 채팅 (자동 서비스 시작). gpu로 인스턴스 지정 가능."""
     inst = await ensure_llm_running(gpu=gpu)
     payload = _coerce_sampling(request.model_dump())
+    if inst.is_ollama:
+        return await _ollama_call(inst.chat(payload))
 
     try:
         async with httpx.AsyncClient(timeout=300.0) as client:
@@ -3012,6 +3059,8 @@ async def llm_list_sessions(gpu: int | None = Query(default=None)):
     """LLM 활성 세션 목록 조회 (gpu 미지정 시 전체 인스턴스 세션 합산)"""
     if gpu is not None:
         inst = await ensure_llm_running(gpu=gpu)
+        if inst.is_ollama:
+            return inst.sessions.list_sessions()
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{inst.url}/sessions")
@@ -3021,7 +3070,9 @@ async def llm_list_sessions(gpu: int | None = Query(default=None)):
     # 전체 인스턴스 세션 합산
     all_sessions = []
     for inst in llm_instances.values():
-        if inst.alive:
+        if inst.alive and inst.is_ollama:
+            all_sessions.extend({**s, "gpu_id": inst.gpu_id} for s in inst.sessions.list_sessions())
+        elif inst.alive:
             try:
                 async with httpx.AsyncClient(timeout=5.0) as client:
                     resp = await client.get(f"{inst.url}/sessions")
@@ -3042,6 +3093,11 @@ async def llm_get_session(session_id: str, gpu: int | None = Query(default=None)
     for inst in targets:
         if not inst.alive:
             continue
+        if inst.is_ollama:
+            detail = inst.sessions.detail(session_id)
+            if detail is not None:
+                return detail
+            continue
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(f"{inst.url}/session/{session_id}")
@@ -3058,6 +3114,10 @@ async def llm_delete_session(session_id: str, gpu: int | None = Query(default=No
     targets = [llm_instances[gpu]] if gpu is not None and gpu in llm_instances else list(llm_instances.values())
     for inst in targets:
         if not inst.alive:
+            continue
+        if inst.is_ollama:
+            if inst.sessions.delete(session_id):
+                return {"message": f"세션 '{session_id}' 삭제 완료"}
             continue
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
