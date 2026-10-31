@@ -40,6 +40,15 @@ touch "$log_file"
 # Update current.log → newest log
 ln -sfn "$(basename "$log_file")" "$CURRENT_LOG"
 
+IFS=':' read -ra extra_dirs <<< "$EXTRA_PATH"
+for ((i = ${#extra_dirs[@]} - 1; i >= 0; i--)); do
+    d="${extra_dirs[i]}"
+    if [ -n "$d" ] && [ -d "$d" ]; then
+        PATH="$d:$PATH"
+    fi
+done
+export PATH
+
 cd "$PROJECT_ROOT"
 nohup "$PYTHON_BIN" "$SERVER_PY" >> "$log_file" 2>&1 </dev/null &
 new_pid=$!

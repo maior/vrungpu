@@ -94,7 +94,9 @@ Use the helper scripts in `scripts/` — they handle PID files, log rotation, an
 
 Logs are written to `logs/server-YYYYMMDD-HHMMSS.log` and the symlink `logs/current.log` always points to the active log. The PID is kept in `run/vrungpu.pid`. Old logs older than 30 days are auto-pruned on start.
 
-Override defaults via env vars: `VRUNGPU_PORT`, `VRUNGPU_HOST`, `VRUNGPU_PYTHON`, `VRUNGPU_STOP_GRACE`, `VRUNGPU_LOG_RETENTION_DAYS`.
+Override defaults via env vars: `VRUNGPU_PORT`, `VRUNGPU_HOST`, `VRUNGPU_PYTHON`, `VRUNGPU_STOP_GRACE`, `VRUNGPU_LOG_RETENTION_DAYS`, `VRUNGPU_EXTRA_PATH`.
+
+`VRUNGPU_EXTRA_PATH` (colon-separated, default `~/.cargo/bin`) is put ahead of `PATH` for submitted jobs, so toolchains installed per-user (e.g. the latest Rust via rustup, ahead of an older distro `rustc`) are what `/run/*` jobs see. Missing directories are skipped.
 
 To run in the foreground (for debugging), call Python directly:
 

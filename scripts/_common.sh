@@ -20,6 +20,10 @@ PID_FILE="$RUN_DIR/vrungpu.pid"
 LOGS_DIR="$PROJECT_ROOT/logs"
 CURRENT_LOG="$LOGS_DIR/current.log"
 
+# Toolchain dirs put ahead of PATH for submitted jobs (e.g. rustup's latest Rust
+# before the distro rustc). Colon-separated; missing dirs are skipped.
+EXTRA_PATH="${VRUNGPU_EXTRA_PATH:-$HOME/.cargo/bin}"
+
 # Stop tuning
 STOP_GRACE_SECONDS="${VRUNGPU_STOP_GRACE:-10}"
 
