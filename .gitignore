@@ -67,3 +67,10 @@ unsloth_compiled_cache/
 # Experiment outputs (E-I gate research)
 ei_results/
 ei_eval_results/
+
+# Pro*C example build outputs
+examples/proc_llm/*.o
+examples/proc_llm/llm_cli
+examples/proc_llm/llm_demo
+examples/proc_llm/llm_demo.c
+examples/proc_llm/*.lis

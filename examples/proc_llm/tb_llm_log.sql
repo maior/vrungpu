@@ -1,0 +1,10 @@
+-- llm_demo.pc가 질문/답변을 기록하는 테이블
+CREATE TABLE TB_LLM_LOG (
+    LOG_SEQ     NUMBER          NOT NULL,
+    REQ_DTM     DATE            DEFAULT SYSDATE NOT NULL,
+    QUESTION    VARCHAR2(4000),
+    ANSWER      VARCHAR2(4000),
+    RC          NUMBER(3),
+    CONSTRAINT PK_TB_LLM_LOG PRIMARY KEY (LOG_SEQ)
+);
+CREATE SEQUENCE SQ_LLM_LOG;

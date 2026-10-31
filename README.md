@@ -519,6 +519,16 @@ r = client.chat.completions.create(
 
 - `GET /v1/models` lists the loaded models; `POST /v1/chat/completions` requires the API token when `VRUNGPU_API_TOKEN` is set (`api_key` is sent as `Authorization: Bearer`).
 
+#### Calling from C / Pro*C
+
+[`examples/proc_llm`](examples/proc_llm/) is a dependency-free C client (POSIX sockets + iconv, no libcurl) for `/v1/chat/completions`, with EUC-KR (CP949) input/output for legacy systems such as Korean brokerage gateway (대외계) programs, a Pro*C demo that logs answers to an Oracle table, and `check_on_vrungpu.py`, which precompiles/compiles/links a `.pc` on the vrungpu server (`/run/sync`, `device=cpu`) so agents can verify generated Pro*C code without a local precompiler.
+
+```bash
+cd examples/proc_llm && make llm_cli
+./llm_cli your-server 9825 "Explain Pro*C indicator variables in one line"
+python3 check_on_vrungpu.py http://your-server:9825 llm_demo.pc llm_client.c llm_client.h   # RESULT: OK
+```
+
 - **No auto-start by default**: `/llm/chat`, `/llm/generate` return `503` when no model is loaded — start one with `/llm/start` first (`/llm/start` with no params loads the default model). Set `VRUNGPU_LLM_AUTOSTART=1` to restore the old behavior of auto-starting the default model on the first call.
 
 | Env var | Default | Meaning |
@@ -1123,8 +1133,10 @@ vrungpu/
 │   │   ├── page.tsx       # Dashboard UI (D3.js charts)
 │   │   └── globals.css    # Animation styles
 │   └── package.json
+├── ollama_backend.py      # Ollama backend for /llm/* and the /v1 proxy
 └── examples/              # Example projects
-    └── mnist_project/
+    ├── mnist_project/
+    └── proc_llm/          # C/Pro*C client for /v1 (EUC-KR) + remote Pro*C build check
 ```
 
 ---
@@ -1229,6 +1241,7 @@ Response:
 
 ## Version History
 
+- **v0.9.0** - Ollama backend (`model=ollama:<name>`, default `ollama:qwen3.8:27b`, no auto-start), per-GPU LLM unload for jobs, OpenAI-compatible `/v1` proxy (`/v1/models`, `/v1/chat/completions` with tool calling and streaming), C/Pro*C client example with EUC-KR support and remote Pro*C build check (`examples/proc_llm`)
 - **v0.8.0** - CPU Task Support: `device="cpu"` opt-in for `/run/async`, `/run/sync`, `/run/project` routes the task to a separate `CPUSlotPool` with auto-detected slot count (`os.sched_getaffinity` → headroom 25%/4-core → divide by 4, cap 16). GPU pool untouched, so CPU and GPU tasks run concurrently without contention. New `GET /pool` endpoint (unified GPU+CPU view), `?device=cpu|gpu` filter on `/tasks`, `VRUNGPU_CPU_SLOTS=N` env override. Subprocesses get `CUDA_VISIBLE_DEVICES=""` + `VRUNGPU_DEVICE="cpu"`. Idempotent DB migration adds `tasks.device` column defaulting to `"gpu"`.
 - **v0.7.0** - Task Management API: `POST /task/{id}/cancel` (SIGTERM→SIGKILL, GPU auto-release), `GET /task/{id}/logs?source=stdout|stderr|all|workspace` (ring-buffer tail for running tasks, file-based tail for frameworks like RecBole that bypass stdout), `GET /task/{id}/logs/stream` (SSE live tail), `GET /task/{id}/files` + `/files/{path}` (workspace browsing with path-traversal protection). Preserves `cancelled` status instead of overwriting with `failed`.
 - **v0.6.0** - Multi-GPU LLM (GPU별 독립 인스턴스, 동시 서빙), File Upload API, DPO fine-tuning (TRL DPOTrainer + LoRA), fix asyncio LimitOverrunError on large subprocess output

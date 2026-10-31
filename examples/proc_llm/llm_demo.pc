@@ -1,0 +1,81 @@
+/* Pro*C에서 vrungpu LLM을 호출하고 결과를 DB에 기록하는 예제
+ *   - 소켓/HTTP는 llm_client.c에 분리 (이 파일에는 EXEC SQL만)
+ *   - 질문/답변은 EUC-KR(CP949) 그대로 사용 → DB 클라이언트 NLS_LANG도 KO16MSWIN949 기준
+ * 실행: ORA_USERID=scott/tiger@DB LLM_HOST=your-server LLM_PORT=9825 ./llm_demo "질문"
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "llm_client.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+static void sql_error(const char *where) {
+    fprintf(stderr, "[%s] %.*s", where, sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+}
+
+/* max 바이트 이내에서 EUC-KR 2바이트 문자 중간이 아닌 위치의 길이 */
+static unsigned short euckr_fit(const char *s, size_t max) {
+    size_t len = strlen(s), n = 0;
+    if (len <= max) return (unsigned short)len;
+    while (n < max) {
+        size_t step = ((unsigned char)s[n] & 0x80) ? 2 : 1;
+        if (n + step > max) break;
+        n += step;
+    }
+    return (unsigned short)n;
+}
+
+int main(int argc, char **argv) {
+    EXEC SQL BEGIN DECLARE SECTION;
+        char     userid[128];
+        VARCHAR  v_question[4000];
+        VARCHAR  v_answer[4000];
+        short    i_answer;
+        int      v_rc;
+        long     v_seq;
+    EXEC SQL END DECLARE SECTION;
+    static char answer[65536];
+    llm_conf conf = { 0 };
+    const char *env;
+
+    if (argc < 2 || !(env = getenv("ORA_USERID")) || !getenv("LLM_HOST")) {
+        fprintf(stderr, "usage: ORA_USERID=user/pass@db LLM_HOST=host [LLM_PORT=9825] %s question(EUC-KR)\n", argv[0]);
+        return 2;
+    }
+    snprintf(userid, sizeof userid, "%s", env);
+    conf.host = getenv("LLM_HOST");
+    conf.port = getenv("LLM_PORT") ? getenv("LLM_PORT") : "9825";
+    conf.api_token = getenv("VRUNGPU_API_TOKEN");
+    conf.timeout_sec = 120;
+
+    EXEC SQL CONNECT :userid;
+    if (sqlca.sqlcode != 0) { sql_error("CONNECT"); return 1; }
+
+    v_rc = llm_chat_euckr(&conf, argv[1], answer, sizeof answer);
+    fprintf(stderr, "llm rc=%d\n", v_rc);
+
+    /* VARCHAR2(4000) 컬럼 길이에 맞춰 자름 (EUC-KR 2바이트 문자 중간에서 끊기지 않게) */
+    v_question.len = euckr_fit(argv[1], sizeof v_question.arr);
+    memcpy(v_question.arr, argv[1], v_question.len);
+    v_answer.len = euckr_fit(answer, sizeof v_answer.arr);
+    memcpy(v_answer.arr, answer, v_answer.len);
+    i_answer = v_answer.len ? 0 : -1;   /* 빈 답변은 NULL로 */
+
+    EXEC SQL SELECT SQ_LLM_LOG.NEXTVAL INTO :v_seq FROM DUAL;
+    if (sqlca.sqlcode != 0) { sql_error("NEXTVAL"); goto rollback; }
+
+    EXEC SQL INSERT INTO TB_LLM_LOG (LOG_SEQ, QUESTION, ANSWER, RC)
+             VALUES (:v_seq, :v_question, :v_answer:i_answer, :v_rc);
+    if (sqlca.sqlcode != 0) { sql_error("INSERT"); goto rollback; }
+
+    EXEC SQL COMMIT WORK RELEASE;
+    printf("LOG_SEQ=%ld\n%s\n", v_seq, answer);
+    return v_rc != LLM_OK;
+
+rollback:
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL ROLLBACK WORK RELEASE;
+    return 1;
+}
